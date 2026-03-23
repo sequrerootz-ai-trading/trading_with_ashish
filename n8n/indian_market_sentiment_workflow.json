@@ -1,0 +1,179 @@
+{
+  "name": "Indian Market News Sentiment",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://newsapi.org/v2/everything",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "(\"Indian stock market\" OR NIFTY OR BANKNIFTY OR SENSEX OR NSE OR BSE) AND (stocks OR market OR equities)"
+            },
+            {
+              "name": "language",
+              "value": "en"
+            },
+            {
+              "name": "sortBy",
+              "value": "publishedAt"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.NEWS_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fetch-news",
+      "name": "Fetch India Financial News",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const articles = Array.isArray($json.articles) ? $json.articles.slice(0, 10) : [];\nconst headlines = articles.map((article, index) => `${index + 1}. ${article.title}`).join('\\n');\nconst prompt = `You are analyzing recent Indian financial news headlines.\\n\\nQuestion: Is sentiment bullish or bearish for Indian stock market?\\n\\nHeadlines:\\n${headlines}\\n\\nReturn strict JSON with:\\n- sentiment: bullish or bearish\\n- confidence_score: number between 0 and 1`;\nreturn [{ json: { headlines, article_count: articles.length, prompt } }];"
+      },
+      "id": "build-prompt",
+      "name": "Build OpenAI Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.OPENAI_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({\n  model: \"gpt-4.1-mini\",\n  input: [\n    {\n      role: \"system\",\n      content: [\n        {\n          type: \"input_text\",\n          text: \"You are a market sentiment classifier focused on Indian equities. Based only on the supplied headlines, classify the Indian stock market sentiment as bullish or bearish. Return only valid JSON.\"\n        }\n      ]\n    },\n    {\n      role: \"user\",\n      content: [\n        {\n          type: \"input_text\",\n          text: $json.prompt\n        }\n      ]\n    }\n  ],\n  text: {\n    format: {\n      type: \"json_schema\",\n      name: \"indian_market_sentiment\",\n      schema: {\n        type: \"object\",\n        properties: {\n          sentiment: { type: \"string\", enum: [\"bullish\", \"bearish\"] },\n          confidence_score: { type: \"number\", minimum: 0, maximum: 1 }\n        },\n        required: [\"sentiment\", \"confidence_score\"],\n        additionalProperties: false\n      }\n    }\n  }\n}) }}",
+        "options": {}
+      },
+      "id": "openai-sentiment",
+      "name": "OpenAI Sentiment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output_text ?? $json.output?.[0]?.content?.[0]?.text ?? '';\nconst parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;\nreturn [{ json: { sentiment: parsed.sentiment, confidence_score: parsed.confidence_score } }];"
+      },
+      "id": "normalize-output",
+      "name": "Normalize Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1290,
+        300
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every 5 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Fetch India Financial News",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch India Financial News": {
+      "main": [
+        [
+          {
+            "node": "Build OpenAI Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build OpenAI Prompt": {
+      "main": [
+        [
+          {
+            "node": "OpenAI Sentiment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Sentiment": {
+      "main": [
+        [
+          {
+            "node": "Normalize Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}
