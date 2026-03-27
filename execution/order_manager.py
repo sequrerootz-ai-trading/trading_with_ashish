@@ -60,10 +60,14 @@ class OrderManager:
         trading_symbol: str,
         exchange: str,
         last_price: float,
+        stop_loss_price: float | None = None,
         product: str | None = None,
     ) -> ManagedOrder:
         quantity = self.calculate_quantity(last_price)
         product_to_use = (product or self.settings.default_product).upper()
+        stop_price_to_use = self._round_to_tick(
+            stop_loss_price if stop_loss_price is not None else self._calculate_stop_loss_price(last_price)
+        )
 
         if self.mode == "PAPER":
             return self._simulate_market_buy(
@@ -71,11 +75,11 @@ class OrderManager:
                 exchange=exchange,
                 last_price=last_price,
                 quantity=quantity,
+                stop_loss_price=stop_price_to_use,
                 product=product_to_use,
             )
 
         self._ensure_live_ready()
-        print("LIVE MODE ACTIVE - REAL MONEY TRADE")
         entry_order_id = self._with_retry(
             lambda: self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
@@ -92,22 +96,33 @@ class OrderManager:
 
         entry_status = self.wait_for_order_completion(entry_order_id)
         entry_price = self._extract_average_price(entry_status, fallback_price=last_price)
-        stop_loss_price = self._calculate_stop_loss_price(entry_price)
+        live_stop_loss_price = self._round_to_tick(stop_price_to_use)
 
-        stop_loss_order_id = self._with_retry(
-            lambda: self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR,
+        try:
+            stop_loss_order_id = self._with_retry(
+                lambda: self.kite.place_order(
+                    variety=self.kite.VARIETY_REGULAR,
+                    exchange=exchange,
+                    tradingsymbol=trading_symbol,
+                    transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                    quantity=quantity,
+                    order_type=self.kite.ORDER_TYPE_SLM,
+                    trigger_price=live_stop_loss_price,
+                    product=product_to_use,
+                    validity=self.kite.VALIDITY_DAY,
+                ),
+                action_name=f"place stop-loss order for {trading_symbol}",
+            )
+        except Exception:
+            logger.exception("Stop-loss placement failed after BUY fill for %s. Attempting emergency exit.", trading_symbol)
+            self.exit_position(
+                trading_symbol=trading_symbol,
                 exchange=exchange,
-                tradingsymbol=trading_symbol,
-                transaction_type=self.kite.TRANSACTION_TYPE_SELL,
                 quantity=quantity,
-                order_type=self.kite.ORDER_TYPE_SLM,
-                trigger_price=stop_loss_price,
+                last_price=entry_price,
                 product=product_to_use,
-                validity=self.kite.VALIDITY_DAY,
-            ),
-            action_name=f"place stop-loss order for {trading_symbol}",
-        )
+            )
+            raise
 
         self.trade_manager.record_trade(
             mode="LIVE",
@@ -126,7 +141,7 @@ class OrderManager:
             entry_order_id=entry_order_id,
             stop_loss_order_id=stop_loss_order_id,
             entry_price=entry_price,
-            stop_loss_price=stop_loss_price,
+            stop_loss_price=live_stop_loss_price,
             status=entry_status["status"],
         )
 
@@ -171,6 +186,65 @@ class OrderManager:
 
         raise TimeoutError(f"Order {order_id} did not complete in time.")
 
+    def exit_position(
+        self,
+        trading_symbol: str,
+        exchange: str,
+        quantity: int,
+        last_price: float,
+        product: str | None = None,
+    ) -> dict[str, Any]:
+        product_to_use = (product or self.settings.default_product).upper()
+
+        if self.mode == "PAPER":
+            order_id = self._next_paper_order_id("EXIT")
+            self._paper_orders[order_id] = {
+                "order_id": order_id,
+                "status": "COMPLETE",
+                "average_price": last_price,
+                "price": last_price,
+                "tradingsymbol": trading_symbol,
+                "exchange": exchange,
+                "transaction_type": "SELL",
+                "product": product_to_use,
+                "quantity": quantity,
+            }
+            self.trade_manager.record_trade(
+                mode="PAPER",
+                symbol=trading_symbol,
+                side="SELL",
+                quantity=quantity,
+                price=last_price,
+                status="SIMULATED_EXIT",
+            )
+            return dict(self._paper_orders[order_id])
+
+        self._ensure_live_ready()
+        order_id = self._with_retry(
+            lambda: self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=trading_symbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                quantity=quantity,
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                product=product_to_use,
+                validity=self.kite.VALIDITY_DAY,
+            ),
+            action_name=f"place market SELL for {trading_symbol}",
+        )
+        order = self.wait_for_order_completion(order_id)
+        exit_price = self._extract_average_price(order, fallback_price=last_price)
+        self.trade_manager.record_trade(
+            mode="LIVE",
+            symbol=trading_symbol,
+            side="SELL",
+            quantity=quantity,
+            price=exit_price,
+            status="COMPLETE",
+        )
+        return order
+
     def trail_stop_loss(
         self,
         trading_symbol: str,
@@ -185,17 +259,37 @@ class OrderManager:
             last_price,
             percent=self.settings.trailing_stop_loss_percent,
         )
+        return self.trail_stop_loss_to_price(
+            trading_symbol=trading_symbol,
+            exchange=exchange,
+            quantity=quantity,
+            stop_loss_order_id=stop_loss_order_id,
+            current_stop_loss_price=current_stop_loss_price,
+            new_stop_loss_price=new_stop_loss_price,
+            product=product,
+        )
 
-        if new_stop_loss_price <= current_stop_loss_price:
+    def trail_stop_loss_to_price(
+        self,
+        trading_symbol: str,
+        exchange: str,
+        quantity: int,
+        stop_loss_order_id: str,
+        current_stop_loss_price: float,
+        new_stop_loss_price: float,
+        product: str | None = None,
+    ) -> float:
+        rounded_stop_loss = self._round_to_tick(new_stop_loss_price)
+        if rounded_stop_loss <= current_stop_loss_price:
             return current_stop_loss_price
 
         if self.mode == "PAPER":
             paper_order = self._paper_orders.get(stop_loss_order_id)
             if paper_order is not None:
-                paper_order["trigger_price"] = new_stop_loss_price
-                paper_order["price"] = new_stop_loss_price
-            logger.info("[PAPER] Trailed stop loss %s to %.2f", trading_symbol, new_stop_loss_price)
-            return new_stop_loss_price
+                paper_order["trigger_price"] = rounded_stop_loss
+                paper_order["price"] = rounded_stop_loss
+            logger.info("[PAPER] Trailed stop loss %s to %.2f", trading_symbol, rounded_stop_loss)
+            return rounded_stop_loss
 
         self._ensure_live_ready()
         product_to_use = (product or self.settings.default_product).upper()
@@ -207,14 +301,14 @@ class OrderManager:
                 tradingsymbol=trading_symbol,
                 quantity=quantity,
                 order_type=self.kite.ORDER_TYPE_SLM,
-                trigger_price=new_stop_loss_price,
+                trigger_price=rounded_stop_loss,
                 product=product_to_use,
                 validity=self.kite.VALIDITY_DAY,
             ),
             action_name=f"trail stop loss for {trading_symbol}",
         )
-        logger.info("[LIVE] Trailed stop loss %s to %.2f", trading_symbol, new_stop_loss_price)
-        return new_stop_loss_price
+        logger.info("[LIVE] Trailed stop loss %s to %.2f", trading_symbol, rounded_stop_loss)
+        return rounded_stop_loss
 
     def _simulate_market_buy(
         self,
@@ -222,11 +316,11 @@ class OrderManager:
         exchange: str,
         last_price: float,
         quantity: int,
+        stop_loss_price: float,
         product: str,
     ) -> ManagedOrder:
         entry_order_id = self._next_paper_order_id("ENTRY")
         stop_loss_order_id = self._next_paper_order_id("SL")
-        stop_loss_price = self._calculate_stop_loss_price(last_price)
 
         self._paper_orders[entry_order_id] = {
             "order_id": entry_order_id,
@@ -318,3 +412,4 @@ class OrderManager:
                 time.sleep(self.settings.retry_delay_seconds)
 
         raise RuntimeError(f"Unable to {action_name} after retries") from last_error
+

@@ -125,13 +125,13 @@ def get_settings() -> Settings:
         )
 
     execution_settings = ExecutionSettings(
-        capital_per_trade=float(os.getenv("CAPITAL_PER_TRADE", "2000")),
-        stop_loss_percent=float(os.getenv("STOP_LOSS_PERCENT", "0.20")),
-        trailing_stop_loss_percent=float(os.getenv("TRAILING_STOP_LOSS_PERCENT", "0.20")),
+        capital_per_trade=_get_env_float("CAPITAL_PER_TRADE", 2000.0),
+        stop_loss_percent=_get_env_float("STOP_LOSS_PERCENT", 0.20),
+        trailing_stop_loss_percent=_get_env_float("TRAILING_STOP_LOSS_PERCENT", 0.20),
         max_retries=int(os.getenv("ORDER_MAX_RETRIES", "5")),
-        retry_delay_seconds=float(os.getenv("ORDER_RETRY_DELAY_SECONDS", "1")),
+        retry_delay_seconds=_get_env_float("ORDER_RETRY_DELAY_SECONDS", 1.0),
         poll_attempts=int(os.getenv("ORDER_STATUS_POLL_ATTEMPTS", "10")),
-        poll_interval_seconds=float(os.getenv("ORDER_STATUS_POLL_INTERVAL_SECONDS", "1")),
+        poll_interval_seconds=_get_env_float("ORDER_STATUS_POLL_INTERVAL_SECONDS", 1.0),
         default_product=os.getenv("ORDER_PRODUCT", "MIS").strip().upper() or "MIS",
     )
 
@@ -183,3 +183,11 @@ def _normalize_equity_symbol(symbol: str) -> str:
         "BANK NIFTY": "BANKNIFTY",
     }
     return aliases.get(value, value)
+
+
+def _get_env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name, str(default)).strip()
+    cleaned_value = "".join(ch for ch in raw_value if ch.isdigit() or ch in {".", "-"})
+    if cleaned_value in {"", ".", "-", "-."}:
+        raise ValueError(f"Invalid float value for {name}: {raw_value}")
+    return float(cleaned_value)

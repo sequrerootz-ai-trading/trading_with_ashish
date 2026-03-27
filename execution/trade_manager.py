@@ -29,8 +29,13 @@ class ActiveTrade:
     entry_low: float
     entry_high: float
     stop_loss: float
-    target: float
+    initial_stop_loss: float
+    quantity: int
     entry_price: float | None
+    highest_price: float | None
+    order_placed: bool
+    entry_order_id: str | None
+    stop_loss_order_id: str | None
     status: str
     created_at: str
 
@@ -72,7 +77,6 @@ class TradeManager:
         entry_low: float,
         entry_high: float,
         stop_loss: float,
-        target: float,
         entry_price: float | None,
     ) -> ActiveTrade:
         trade = ActiveTrade(
@@ -84,21 +88,25 @@ class TradeManager:
             entry_low=entry_low,
             entry_high=entry_high,
             stop_loss=stop_loss,
-            target=target,
+            initial_stop_loss=stop_loss,
+            quantity=0,
             entry_price=entry_price,
+            highest_price=entry_price,
+            order_placed=False,
+            entry_order_id=None,
+            stop_loss_order_id=None,
             status="PENDING_ENTRY",
             created_at=datetime.now(UTC).isoformat(),
         )
         self._active_trades[symbol] = trade
         logger.info(
-            "[PLAN] Opened trade plan for %s | %s | %s | entry=%.2f-%.2f | sl=%.2f | target=%.2f",
+            "[PLAN] Opened trade plan for %s | %s | %s | entry=%.2f-%.2f | sl=%.2f",
             symbol,
             signal,
             trading_symbol,
             entry_low,
             entry_high,
             stop_loss,
-            target,
         )
         return trade
 
@@ -108,7 +116,7 @@ class TradeManager:
     def has_active_trade(self, symbol: str) -> bool:
         return symbol in self._active_trades
 
-    def update_active_trade(self, symbol: str, **changes: float | str) -> ActiveTrade | None:
+    def update_active_trade(self, symbol: str, **changes: float | int | str | bool | None) -> ActiveTrade | None:
         trade = self._active_trades.get(symbol)
         if trade is None:
             return None
@@ -121,8 +129,13 @@ class TradeManager:
             entry_low=float(changes.get("entry_low", trade.entry_low)),
             entry_high=float(changes.get("entry_high", trade.entry_high)),
             stop_loss=float(changes.get("stop_loss", trade.stop_loss)),
-            target=float(changes.get("target", trade.target)),
+            initial_stop_loss=float(changes.get("initial_stop_loss", trade.initial_stop_loss)),
+            quantity=int(changes.get("quantity", trade.quantity)),
             entry_price=(float(changes["entry_price"]) if "entry_price" in changes and changes["entry_price"] is not None else trade.entry_price),
+            highest_price=(float(changes["highest_price"]) if "highest_price" in changes and changes["highest_price"] is not None else trade.highest_price),
+            order_placed=bool(changes.get("order_placed", trade.order_placed)),
+            entry_order_id=(str(changes["entry_order_id"]) if "entry_order_id" in changes and changes["entry_order_id"] is not None else trade.entry_order_id),
+            stop_loss_order_id=(str(changes["stop_loss_order_id"]) if "stop_loss_order_id" in changes and changes["stop_loss_order_id"] is not None else trade.stop_loss_order_id),
             status=str(changes.get("status", trade.status)),
             created_at=trade.created_at,
         )

@@ -10,13 +10,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 load_dotenv(ENV_FILE, override=False)
 
-MODE = "PAPER"  # or "LIVE"
+MODE = os.getenv("MODE", "PAPER").strip().upper() or "PAPER"
 VALID_MODES = {"PAPER", "LIVE"}
 VALID_MARKET_TYPES = {"EQUITY", "MCX"}
 
 
 def get_mode() -> str:
-    mode = MODE.strip().upper()
+    mode = os.getenv("MODE", MODE).strip().upper() or MODE
     if mode not in VALID_MODES:
         raise Exception("Invalid MODE")
     return mode
