@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from kiteconnect import KiteConnect
 
@@ -105,10 +105,15 @@ class OptionPremiumService:
         if not valid_expiries:
             return None
 
-        nearest_expiry = valid_expiries[0]
-        expiry_candidates = [row for row in candidates if row.get("expiry") == nearest_expiry]
+        preferred_expiry = self._select_preferred_expiry(valid_expiries)
+        expiry_candidates = [row for row in candidates if row.get("expiry") == preferred_expiry]
+        if not expiry_candidates:
+            expiry_candidates = [row for row in candidates if row.get("expiry") == valid_expiries[0]]
+
+        target_strikes = _preferred_strikes_for_spot(spot_price, instrument_type, expiry_candidates)
         expiry_candidates.sort(
             key=lambda row: (
+                0 if (_normalized_option_strike(row) in target_strikes) else 1,
                 abs((_normalized_option_strike(row) or spot_price) - spot_price),
                 0 if str(row.get("exchange") or "").upper() == "NFO" else 1,
                 str(row.get("tradingsymbol") or ""),
@@ -116,12 +121,32 @@ class OptionPremiumService:
         )
         return expiry_candidates[0] if expiry_candidates else None
 
+    def _select_preferred_expiry(self, expiries: list[date]) -> date:
+        if not expiries:
+            raise ValueError("expiries cannot be empty")
+        today = date.today()
+        if today == expiries[0] and datetime.now().hour >= 13 and len(expiries) > 1:
+            return expiries[1]
+        return expiries[0]
+
     def _load_instruments(self, exchange: str) -> list[dict]:
         instruments = self._instrument_cache.get(exchange)
         if instruments is None:
             instruments = self.kite.instruments(exchange=exchange)
             self._instrument_cache[exchange] = instruments
         return instruments
+
+
+def _preferred_strikes_for_spot(spot_price: float, instrument_type: str, contracts: list[dict]) -> set[float]:
+    strikes = sorted({_normalized_option_strike(row) for row in contracts if _normalized_option_strike(row) is not None})
+    if not strikes:
+        return set()
+    atm = min(strikes, key=lambda strike: abs(strike - spot_price))
+    lower = max([strike for strike in strikes if strike <= atm], default=atm)
+    upper = min([strike for strike in strikes if strike >= atm], default=atm)
+    if instrument_type == "CE":
+        return {atm, lower}
+    return {atm, upper}
 
 
 def _option_name_matches(row: dict, symbol: str) -> bool:

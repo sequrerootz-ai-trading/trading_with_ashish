@@ -34,9 +34,40 @@ def normalize_sentiment(sentiment: str) -> str:
 def generate_final_signal(technical_signal: str, sentiment: str) -> FinalSignal:
     normalized_technical_signal = normalize_technical_signal(technical_signal)
     normalized_sentiment = normalize_sentiment(sentiment)
+
     technical_bias = TECHNICAL_TO_SENTIMENT[normalized_technical_signal]
 
-    if technical_bias != normalized_sentiment:
-        return FinalSignal(final_signal=None, confidence_score=0.0)
+    # -------------------------------
+    # Improved Confidence Logic (SAFE)
+    # -------------------------------
 
-    return FinalSignal(final_signal=normalized_technical_signal, confidence_score=1.0)
+    confidence = 0.0
+
+    # 1. Agreement weight
+    if technical_bias == normalized_sentiment:
+        confidence += 0.6
+    else:
+        confidence -= 0.4  # penalize mismatch
+
+    # 2. Base reliability (keeps system stable)
+    confidence += 0.2
+
+    # Normalize confidence between 0 and 1
+    confidence = max(0.0, min(1.0, confidence))
+
+    # -------------------------------
+    # Decision Logic (Backward Compatible)
+    # -------------------------------
+
+    # Maintain original behavior: no trade if mismatch
+    if technical_bias != normalized_sentiment:
+        return FinalSignal(final_signal=None, confidence_score=confidence)
+
+    # Add minimum confidence threshold (prevents weak trades)
+    if confidence < 0.5:
+        return FinalSignal(final_signal=None, confidence_score=confidence)
+
+    return FinalSignal(
+        final_signal=normalized_technical_signal,
+        confidence_score=confidence,
+    )

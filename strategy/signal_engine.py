@@ -1,11 +1,100 @@
 from __future__ import annotations
 
+import logging
+from collections import defaultdict
+from datetime import UTC, datetime
+
 from config import get_market_type
 from data.candle_store import Candle
 from data.database import TradingDatabase
+from strategy.market_regime import detect_market_regime
 from strategy.signal_types import GeneratedSignal, SignalContext
 from strategy.strategy_equity import generate_equity_signal
 from strategy.strategy_mcx import generate_mcx_signal
+
+logger = logging.getLogger(__name__)
+
+_last_signal_time: dict[str, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=UTC))
+_daily_trade_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+
+def _is_valid_signal(signal: GeneratedSignal) -> bool:
+    return signal is not None and signal.signal != "NO_TRADE"
+
+
+def _get_confidence_threshold(data: SignalContext) -> float:
+    if data.timeframe_minutes <= 3:
+        return 0.50
+    if data.timeframe_minutes <= 5:
+        return 0.55
+    return 0.60
+
+
+def _passes_confidence_filter(signal: GeneratedSignal, data: SignalContext) -> bool:
+    threshold = _get_confidence_threshold(data)
+    return signal.confidence >= threshold
+
+
+def _check_market_regime(data: SignalContext) -> tuple[bool, str]:
+    if len(data.candles) < 20:
+        return True, "regime_warmup"
+
+    try:
+        regime = detect_market_regime(data.candles)
+        if regime.regime == "SIDEWAYS":
+            vol_spike = regime.volume_spike_ratio or 0.0
+            if vol_spike >= 1.5:
+                logger.info(
+                    "[REGIME] SIDEWAYS but volume spike=%.2f - allowing (breakout watch)",
+                    vol_spike,
+                )
+                return True, "sideways_with_volume_spike"
+
+            logger.info(
+                "[REGIME] Blocked - SIDEWAYS (ADX=%.1f, range=%.3f, vol_ratio=%.2f)",
+                regime.adx or 0.0,
+                regime.range_pct,
+                vol_spike,
+            )
+            return False, "sideways_market_blocked"
+
+        logger.debug("[REGIME] Allowed - regime=%s ADX=%.1f", regime.regime, regime.adx or 0.0)
+        return True, regime.regime.lower()
+    except Exception as exc:
+        logger.warning("[REGIME] Detection error - allowing trade: %s", exc)
+        return True, "regime_check_error"
+
+
+def _check_trade_cooldown(symbol: str, cooldown_minutes: int = 5) -> tuple[bool, str]:
+    now = datetime.now(UTC)
+    last = _last_signal_time[symbol]
+    elapsed = (now - last).total_seconds() / 60.0
+    if elapsed < cooldown_minutes:
+        remaining = cooldown_minutes - elapsed
+        logger.info("[COOLDOWN] %s - %.1f min remaining", symbol, remaining)
+        return False, f"cooldown_active_{remaining:.1f}min"
+    return True, "cooldown_ok"
+
+
+def _check_daily_trade_limit(symbol: str, max_trades: int = 5) -> tuple[bool, str]:
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    count = _daily_trade_counts[symbol][today]
+    if count >= max_trades:
+        logger.info("[DAILY_LIMIT] %s - max %d trades reached (count=%d)", symbol, max_trades, count)
+        return False, f"daily_limit_reached_{count}"
+    return True, f"trades_today_{count}"
+
+
+def _record_signal_fired(symbol: str) -> None:
+    now = datetime.now(UTC)
+    today = now.strftime("%Y-%m-%d")
+    _last_signal_time[symbol] = now
+    _daily_trade_counts[symbol][today] += 1
+    logger.debug(
+        "[TRADE_CONTROL] %s - recorded | today_count=%d",
+        symbol,
+        _daily_trade_counts[symbol][today],
+    )
 
 
 def get_last_closed_candle(symbol: str, database: TradingDatabase) -> Candle | None:
@@ -16,28 +105,100 @@ def store_market_data(data: Candle, database: TradingDatabase) -> bool:
     return database.store_market_data(data)
 
 
-def fetch_or_get_cached_news(symbol: str, news_service) -> list[str]:
-    return news_service.fetch_or_get_cached_news(symbol)
-
-
-def get_sentiment_with_cache(symbol: str, headlines: list[str], news_service) -> dict[str, object]:
-    return news_service.get_sentiment_with_cache(symbol, headlines)
-
-
 def generate_signal(
     symbol: str,
     market_type: str,
     data: SignalContext,
     sentiment: dict[str, object] | None = None,
+    cooldown_minutes: int = 5,
+    max_trades_per_day: int = 5,
 ) -> GeneratedSignal:
-    normalized_market_type = market_type.strip().upper() if market_type else get_market_type()
+    normalized_market_type = (market_type or get_market_type()).strip().upper()
+    now_ts = datetime.now(UTC).isoformat()
+
+    regime_ok, regime_reason = _check_market_regime(data)
+    if not regime_ok:
+        return GeneratedSignal(
+            symbol=symbol,
+            timestamp=now_ts,
+            signal="NO_TRADE",
+            reason=regime_reason,
+            confidence=0.0,
+        )
+
+    limit_ok, limit_reason = _check_daily_trade_limit(symbol, max_trades_per_day)
+    if not limit_ok:
+        return GeneratedSignal(
+            symbol=symbol,
+            timestamp=now_ts,
+            signal="NO_TRADE",
+            reason=limit_reason,
+            confidence=0.0,
+        )
+
+    cooldown_ok, cooldown_reason = _check_trade_cooldown(symbol, cooldown_minutes)
+    if not cooldown_ok:
+        return GeneratedSignal(
+            symbol=symbol,
+            timestamp=now_ts,
+            signal="NO_TRADE",
+            reason=cooldown_reason,
+            confidence=0.0,
+        )
+
     if normalized_market_type == "MCX":
-        return generate_mcx_signal(symbol, data)
-    return generate_equity_signal(symbol, data, sentiment or _default_sentiment())
+        signal = generate_mcx_signal(symbol, data)
+    else:
+        signal = generate_equity_signal(symbol, data, sentiment or _default_sentiment())
+
+    if signal is None:
+        logger.warning("[SIGNAL_ENGINE] %s - strategy returned None", symbol)
+        return GeneratedSignal(
+            symbol=symbol,
+            timestamp=now_ts,
+            signal="NO_TRADE",
+            reason="strategy_returned_none",
+            confidence=0.0,
+        )
+
+    if _is_valid_signal(signal) and not _passes_confidence_filter(signal, data):
+        threshold = _get_confidence_threshold(data)
+        logger.info(
+            "[FILTER] %s low confidence %.2f < %.2f",
+            symbol, signal.confidence, threshold,
+        )
+        return GeneratedSignal(
+            symbol=symbol,
+            timestamp=signal.timestamp,
+            signal="NO_TRADE",
+            reason=f"low_confidence_filtered<{threshold}",
+            confidence=signal.confidence,
+        )
+
+    if _is_valid_signal(signal):
+        _record_signal_fired(symbol)
+
+    logger.info(
+        "[SIGNAL_ENGINE] %s | Signal=%s | Confidence=%.2f | Regime=%s",
+        symbol, signal.signal, signal.confidence, regime_reason,
+    )
+    return signal
 
 
 def store_signal(signal: GeneratedSignal, database: TradingDatabase) -> None:
-    database.store_signal(signal.symbol, signal.timestamp or "", signal.signal, signal.reason)
+    if signal.timestamp is None:
+        logger.warning("[SIGNAL_ENGINE] %s has no timestamp - storing empty string", signal.symbol)
+    success = database.store_signal(
+        signal.symbol,
+        signal.timestamp or "",
+        signal.signal,
+        signal.reason,
+    )
+    if not success:
+        logger.warning(
+            "[SIGNAL_ENGINE] Failed to store signal for %s | signal=%s",
+            signal.symbol, signal.signal,
+        )
 
 
 def _default_sentiment() -> dict[str, object]:

@@ -10,6 +10,7 @@ from typing import Callable
 
 from kiteconnect import KiteTicker
 
+from config import get_mode
 from config.settings import InstrumentConfig, Settings
 from data.candle_store import Candle, CandleAggregator
 from data.kite_client import KiteClients
@@ -73,7 +74,7 @@ class MarketDataService:
         ticker.on_reconnect = self._on_reconnect
         ticker.on_noreconnect = self._on_noreconnect
 
-        logger.info("Starting KiteTicker stream...")
+        logger.info("[%s] Starting KiteTicker stream...", get_mode())
         self._start_heartbeat()
         self._start_countdown()
         ticker.connect(threaded=False)
@@ -113,17 +114,19 @@ class MarketDataService:
     def _on_connect(self, ws: KiteTicker, response: dict) -> None:
         tokens = [instrument.instrument_token for instrument in self._resolved_instruments]
         symbol = self._resolved_instruments[0].label
-        logger.info("Connected. Subscribing to instruments: %s", tokens)
+        mode = get_mode()
+        logger.info("[%s] Connected. Subscribing to instruments: %s", mode, tokens)
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_FULL, tokens)
         logger.info(
-            "Feed active for %s | timeframe=%s min",
+            "[%s] Feed active for %s | timeframe=%s min",
+            mode,
             symbol,
             self.settings.candle_interval_minutes,
         )
         print(
             colorize(
-                f"[WAIT] Feed active for {symbol} | waiting for candle close signal...",
+                f"[{mode} WAIT] Feed active for {symbol} | waiting for candle close signal...",
                 YELLOW,
                 bold=True,
             )
@@ -223,21 +226,14 @@ class MarketDataService:
         fallback_quantity: int,
     ) -> int:
         previous_volume = self._last_volumes.get(symbol)
-        self._last_volumes[symbol] = current_volume
-
-        if current_volume <= 0:
-            return max(fallback_quantity, 0)
+        self._last_volumes[symbol] = max(current_volume, 0)
         if previous_volume is None:
-            return 0
-        if current_volume < previous_volume:
             return max(fallback_quantity, 0)
-        return current_volume - previous_volume
+        delta = current_volume - previous_volume
+        if delta > 0:
+            return delta
+        return max(fallback_quantity, 0)
 
     @staticmethod
     def _default_on_candle(candle: Candle) -> None:
-        print(
-            f"{candle.symbol} | {candle.start:%Y-%m-%d %H:%M} -> {candle.end:%H:%M} "
-            f"| O:{candle.open:.2f} H:{candle.high:.2f} "
-            f"L:{candle.low:.2f} C:{candle.close:.2f} V:{candle.volume}"
-        )
-
+        logger.info("Closed candle: %s %s close=%.2f", candle.symbol, candle.end.isoformat(), candle.close)

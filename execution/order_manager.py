@@ -42,17 +42,58 @@ class OrderManager:
         self.trade_manager = trade_manager or TradeManager()
         self._paper_orders: dict[str, dict[str, Any]] = {}
         self._paper_order_count = 0
+        self._positions: dict[str, dict[str, Any]] = {}
 
-    def calculate_quantity(self, last_price: float) -> int:
+    def _has_open_position(self, trading_symbol: str) -> bool:
+        pos = self._positions.get(trading_symbol)
+        return bool(pos and pos.get("quantity", 0) > 0)
+
+    def _update_position(self, trading_symbol: str, quantity: int, price: float, side: str) -> None:
+        if side == "BUY":
+            self._positions[trading_symbol] = {
+                "quantity": quantity,
+                "avg_price": price,
+                "side": "LONG",
+            }
+            return
+
+        if side == "SELL":
+            current_position = self._positions.get(trading_symbol)
+            if current_position is None:
+                return
+            remaining_quantity = max(int(current_position.get("quantity", 0)) - quantity, 0)
+            if remaining_quantity <= 0:
+                self._positions.pop(trading_symbol, None)
+                return
+            self._positions[trading_symbol] = {
+                "quantity": remaining_quantity,
+                "avg_price": current_position.get("avg_price", price),
+                "side": "LONG",
+            }
+
+    def calculate_quantity(self, last_price: float, capital_override: float | None = None) -> int:
         if last_price <= 0:
             raise ValueError("Last price must be greater than 0 for quantity calculation.")
 
         lot_size = self.instrument.lot_size if self.instrument is not None else 1
-        units = int(self.settings.capital_per_trade // last_price)
+        capital = capital_override if capital_override is not None else self.settings.capital_per_trade
+        units = int(capital // last_price)
         if lot_size <= 1:
             return max(units, 1)
 
         lots = max(units // lot_size, 1)
+        return lots * lot_size
+
+    def calculate_risk_quantity(self, entry_price: float, stop_loss_price: float) -> int:
+        if entry_price <= 0:
+            raise ValueError("Entry price must be greater than 0 for risk sizing.")
+        risk_amount = max(self.settings.account_balance * self.settings.risk_per_trade_pct, 1.0)
+        per_unit_risk = max(abs(entry_price - stop_loss_price), 0.01)
+        raw_quantity = int(risk_amount // per_unit_risk)
+        lot_size = self.instrument.lot_size if self.instrument is not None else 1
+        if lot_size <= 1:
+            return max(raw_quantity, 1)
+        lots = max(raw_quantity // lot_size, 1)
         return lots * lot_size
 
     def place_market_buy(
@@ -61,9 +102,14 @@ class OrderManager:
         exchange: str,
         last_price: float,
         stop_loss_price: float | None = None,
+        quantity_override: int | None = None,
         product: str | None = None,
     ) -> ManagedOrder:
-        quantity = self.calculate_quantity(last_price)
+        if self._has_open_position(trading_symbol):
+            logger.warning("Position already exists for %s. Skipping BUY.", trading_symbol)
+            raise RuntimeError(f"Duplicate trade prevented for {trading_symbol}")
+
+        quantity = quantity_override if quantity_override is not None else self.calculate_quantity(last_price)
         product_to_use = (product or self.settings.default_product).upper()
         stop_price_to_use = self._round_to_tick(
             stop_loss_price if stop_loss_price is not None else self._calculate_stop_loss_price(last_price)
@@ -96,33 +142,19 @@ class OrderManager:
 
         entry_status = self.wait_for_order_completion(entry_order_id)
         entry_price = self._extract_average_price(entry_status, fallback_price=last_price)
-        live_stop_loss_price = self._round_to_tick(stop_price_to_use)
+        slippage = abs(entry_price - last_price)
+        logger.info("Slippage for %s: %.2f", trading_symbol, slippage)
 
-        try:
-            stop_loss_order_id = self._with_retry(
-                lambda: self.kite.place_order(
-                    variety=self.kite.VARIETY_REGULAR,
-                    exchange=exchange,
-                    tradingsymbol=trading_symbol,
-                    transaction_type=self.kite.TRANSACTION_TYPE_SELL,
-                    quantity=quantity,
-                    order_type=self.kite.ORDER_TYPE_SLM,
-                    trigger_price=live_stop_loss_price,
-                    product=product_to_use,
-                    validity=self.kite.VALIDITY_DAY,
-                ),
-                action_name=f"place stop-loss order for {trading_symbol}",
-            )
-        except Exception:
-            logger.exception("Stop-loss placement failed after BUY fill for %s. Attempting emergency exit.", trading_symbol)
-            self.exit_position(
-                trading_symbol=trading_symbol,
-                exchange=exchange,
-                quantity=quantity,
-                last_price=entry_price,
-                product=product_to_use,
-            )
-            raise
+        live_stop_loss_price = self._round_to_tick(
+            stop_loss_price if stop_loss_price is not None else self._calculate_stop_loss_price(entry_price)
+        )
+        stop_loss_order_id = self.place_stop_loss_order(
+            trading_symbol=trading_symbol,
+            exchange=exchange,
+            quantity=quantity,
+            stop_loss_price=live_stop_loss_price,
+            product=product_to_use,
+        )
 
         self.trade_manager.record_trade(
             mode="LIVE",
@@ -132,6 +164,7 @@ class OrderManager:
             price=entry_price,
             status="COMPLETE",
         )
+        self._update_position(trading_symbol, quantity, entry_price, "BUY")
         logger.info("[LIVE] Order placed %s @ %.2f", trading_symbol, entry_price)
 
         return ManagedOrder(
@@ -145,6 +178,87 @@ class OrderManager:
             status=entry_status["status"],
         )
 
+    def place_stop_loss_order(
+        self,
+        trading_symbol: str,
+        exchange: str,
+        quantity: int,
+        stop_loss_price: float,
+        product: str | None = None,
+    ) -> str:
+        product_to_use = (product or self.settings.default_product).upper()
+        rounded_stop = self._round_to_tick(stop_loss_price)
+
+        if self.mode == "PAPER":
+            stop_loss_order_id = self._next_paper_order_id("SL")
+            self._paper_orders[stop_loss_order_id] = {
+                "order_id": stop_loss_order_id,
+                "status": "TRIGGER PENDING",
+                "average_price": 0.0,
+                "price": rounded_stop,
+                "trigger_price": rounded_stop,
+                "tradingsymbol": trading_symbol,
+                "exchange": exchange,
+                "transaction_type": "SELL",
+                "product": product_to_use,
+                "quantity": quantity,
+            }
+            return stop_loss_order_id
+
+        self._ensure_live_ready()
+        return self._with_retry(
+            lambda: self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=trading_symbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                quantity=quantity,
+                order_type=self.kite.ORDER_TYPE_SLM,
+                trigger_price=rounded_stop,
+                product=product_to_use,
+                validity=self.kite.VALIDITY_DAY,
+            ),
+            action_name=f"place stop-loss order for {trading_symbol}",
+        )
+
+    def cancel_order(self, order_id: str, variety: str | None = None) -> None:
+        if self.mode == "PAPER":
+            order = self._paper_orders.get(order_id)
+            if order is not None:
+                order["status"] = "CANCELLED"
+            return
+
+        self._ensure_live_ready()
+        self._with_retry(
+            lambda: self.kite.cancel_order(
+                variety=variety or self.kite.VARIETY_REGULAR,
+                order_id=order_id,
+            ),
+            action_name=f"cancel order {order_id}",
+        )
+
+    def replace_stop_loss_order(
+        self,
+        trading_symbol: str,
+        exchange: str,
+        quantity: int,
+        current_order_id: str | None,
+        stop_loss_price: float,
+        product: str | None = None,
+    ) -> str:
+        if current_order_id:
+            try:
+                self.cancel_order(current_order_id)
+            except Exception as exc:
+                logger.warning("Unable to cancel stop-loss order %s: %s", current_order_id, exc)
+        return self.place_stop_loss_order(
+            trading_symbol=trading_symbol,
+            exchange=exchange,
+            quantity=quantity,
+            stop_loss_price=stop_loss_price,
+            product=product,
+        )
+
     def check_order_status(self, order_id: str) -> dict[str, Any]:
         if self.mode == "PAPER":
             order = self._paper_orders.get(order_id)
@@ -153,10 +267,7 @@ class OrderManager:
             return dict(order)
 
         self._ensure_live_ready()
-        orders = self._with_retry(
-            self.kite.orders,
-            action_name=f"fetch order book for {order_id}",
-        )
+        orders = self._with_retry(self.kite.orders, action_name=f"fetch order book for {order_id}")
         order = next((item for item in orders if item["order_id"] == order_id), None)
         if order is None:
             raise ValueError(f"Order not found: {order_id}")
@@ -167,7 +278,6 @@ class OrderManager:
             return self.check_order_status(order_id)
 
         terminal_statuses = {"COMPLETE", "REJECTED", "CANCELLED"}
-
         for attempt in range(1, self.settings.poll_attempts + 1):
             order = self.check_order_status(order_id)
             status = order.get("status", "UNKNOWN")
@@ -184,7 +294,65 @@ class OrderManager:
                 return order
             time.sleep(self.settings.poll_interval_seconds)
 
-        raise TimeoutError(f"Order {order_id} did not complete in time.")
+        raise RuntimeError(f"Order {order_id} did not complete within polling window")
+
+    def _simulate_market_buy(
+        self,
+        trading_symbol: str,
+        exchange: str,
+        last_price: float,
+        quantity: int,
+        stop_loss_price: float,
+        product: str,
+    ) -> ManagedOrder:
+        entry_order_id = self._next_paper_order_id("ENTRY")
+        stop_loss_order_id = self._next_paper_order_id("SL")
+
+        self._paper_orders[entry_order_id] = {
+            "order_id": entry_order_id,
+            "status": "COMPLETE",
+            "average_price": last_price,
+            "price": last_price,
+            "tradingsymbol": trading_symbol,
+            "exchange": exchange,
+            "transaction_type": "BUY",
+            "product": product,
+            "quantity": quantity,
+        }
+        self._paper_orders[stop_loss_order_id] = {
+            "order_id": stop_loss_order_id,
+            "status": "TRIGGER PENDING",
+            "average_price": 0.0,
+            "price": stop_loss_price,
+            "trigger_price": stop_loss_price,
+            "tradingsymbol": trading_symbol,
+            "exchange": exchange,
+            "transaction_type": "SELL",
+            "product": product,
+            "quantity": quantity,
+        }
+
+        self.trade_manager.record_trade(
+            mode="PAPER",
+            symbol=trading_symbol,
+            side="BUY",
+            quantity=quantity,
+            price=last_price,
+            status="SIMULATED",
+        )
+        self._update_position(trading_symbol, quantity, last_price, "BUY")
+        logger.info("[PAPER] Simulated BUY %s @ %.2f", trading_symbol, last_price)
+
+        return ManagedOrder(
+            trading_symbol=trading_symbol,
+            exchange=exchange,
+            quantity=quantity,
+            entry_order_id=entry_order_id,
+            stop_loss_order_id=stop_loss_order_id,
+            entry_price=last_price,
+            stop_loss_price=stop_loss_price,
+            status="COMPLETE",
+        )
 
     def exit_position(
         self,
@@ -209,6 +377,7 @@ class OrderManager:
                 "product": product_to_use,
                 "quantity": quantity,
             }
+            self._update_position(trading_symbol, quantity, last_price, "SELL")
             self.trade_manager.record_trade(
                 mode="PAPER",
                 symbol=trading_symbol,
@@ -235,6 +404,7 @@ class OrderManager:
         )
         order = self.wait_for_order_completion(order_id)
         exit_price = self._extract_average_price(order, fallback_price=last_price)
+        self._update_position(trading_symbol, quantity, exit_price, "SELL")
         self.trade_manager.record_trade(
             mode="LIVE",
             symbol=trading_symbol,
@@ -288,6 +458,7 @@ class OrderManager:
             if paper_order is not None:
                 paper_order["trigger_price"] = rounded_stop_loss
                 paper_order["price"] = rounded_stop_loss
+                paper_order["quantity"] = quantity
             logger.info("[PAPER] Trailed stop loss %s to %.2f", trading_symbol, rounded_stop_loss)
             return rounded_stop_loss
 
@@ -309,63 +480,6 @@ class OrderManager:
         )
         logger.info("[LIVE] Trailed stop loss %s to %.2f", trading_symbol, rounded_stop_loss)
         return rounded_stop_loss
-
-    def _simulate_market_buy(
-        self,
-        trading_symbol: str,
-        exchange: str,
-        last_price: float,
-        quantity: int,
-        stop_loss_price: float,
-        product: str,
-    ) -> ManagedOrder:
-        entry_order_id = self._next_paper_order_id("ENTRY")
-        stop_loss_order_id = self._next_paper_order_id("SL")
-
-        self._paper_orders[entry_order_id] = {
-            "order_id": entry_order_id,
-            "status": "COMPLETE",
-            "average_price": last_price,
-            "price": last_price,
-            "tradingsymbol": trading_symbol,
-            "exchange": exchange,
-            "transaction_type": "BUY",
-            "product": product,
-            "quantity": quantity,
-        }
-        self._paper_orders[stop_loss_order_id] = {
-            "order_id": stop_loss_order_id,
-            "status": "TRIGGER PENDING",
-            "average_price": 0.0,
-            "price": stop_loss_price,
-            "trigger_price": stop_loss_price,
-            "tradingsymbol": trading_symbol,
-            "exchange": exchange,
-            "transaction_type": "SELL",
-            "product": product,
-            "quantity": quantity,
-        }
-
-        self.trade_manager.record_trade(
-            mode="PAPER",
-            symbol=trading_symbol,
-            side="BUY",
-            quantity=quantity,
-            price=last_price,
-            status="SIMULATED",
-        )
-        logger.info("[PAPER] Simulated BUY %s @ %.2f", trading_symbol, last_price)
-
-        return ManagedOrder(
-            trading_symbol=trading_symbol,
-            exchange=exchange,
-            quantity=quantity,
-            entry_order_id=entry_order_id,
-            stop_loss_order_id=stop_loss_order_id,
-            entry_price=last_price,
-            stop_loss_price=stop_loss_price,
-            status="COMPLETE",
-        )
 
     def _next_paper_order_id(self, prefix: str) -> str:
         self._paper_order_count += 1
@@ -398,7 +512,7 @@ class OrderManager:
         for attempt in range(1, self.settings.max_retries + 1):
             try:
                 return operation()
-            except Exception as exc:  # pragma: no cover - broker/network failure path
+            except Exception as exc:  # pragma: no cover
                 last_error = exc
                 logger.warning(
                     "%s failed on attempt %s/%s: %s",
@@ -412,4 +526,3 @@ class OrderManager:
                 time.sleep(self.settings.retry_delay_seconds)
 
         raise RuntimeError(f"Unable to {action_name} after retries") from last_error
-
