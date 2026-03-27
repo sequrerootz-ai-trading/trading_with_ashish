@@ -13,6 +13,7 @@ from kiteconnect import KiteTicker
 from config.settings import InstrumentConfig, Settings
 from data.candle_store import Candle, CandleAggregator
 from data.kite_client import KiteClients
+from market_selector import resolve_instrument_selection
 from utils_console import YELLOW, colorize
 
 
@@ -90,43 +91,22 @@ class MarketDataService:
         self,
         instrument_configs: list[InstrumentConfig],
     ) -> list[ResolvedInstrument]:
-        needed_by_exchange: dict[str, set[str]] = {}
-        for instrument in instrument_configs:
-            needed_by_exchange.setdefault(instrument.exchange, set()).add(
-                instrument.tradingsymbol
-            )
-
-        exchange_rows: dict[str, list[dict]] = {}
-        for exchange in needed_by_exchange:
-            exchange_rows[exchange] = self.clients.kite.instruments(exchange=exchange)
-
         resolved: list[ResolvedInstrument] = []
         for instrument in instrument_configs:
-            rows = exchange_rows[instrument.exchange]
-            match = next(
-                (
-                    row
-                    for row in rows
-                    if row["tradingsymbol"] == instrument.tradingsymbol
-                ),
-                None,
+            selection = resolve_instrument_selection(
+                symbol=instrument.label,
+                market_type=self.settings.market_type,
+                kite=self.clients.kite,
+                settings=self.settings,
             )
-            if match is None:
-                raise ValueError(
-                    f"Instrument not found for {instrument.label}: "
-                    f"{instrument.exchange}:{instrument.tradingsymbol}"
-                )
-
             resolved_instrument = ResolvedInstrument(
                 label=instrument.label,
-                exchange=instrument.exchange,
-                tradingsymbol=instrument.tradingsymbol,
-                instrument_token=int(match["instrument_token"]),
+                exchange=selection.exchange,
+                tradingsymbol=selection.tradingsymbol,
+                instrument_token=selection.instrument_token,
             )
             resolved.append(resolved_instrument)
-            self._token_to_symbol[resolved_instrument.instrument_token] = (
-                resolved_instrument.label
-            )
+            self._token_to_symbol[resolved_instrument.instrument_token] = resolved_instrument.label
 
         return resolved
 
@@ -205,18 +185,6 @@ class MarketDataService:
     def _heartbeat_loop(self) -> None:
         while True:
             time.sleep(30)
-            last_tick = self._last_tick_at.strftime("%H:%M:%S") if self._last_tick_at else "no ticks yet"
-            last_candle = (
-                self._last_closed_candle_at.strftime("%H:%M:%S")
-                if self._last_closed_candle_at
-                else "no candle closed yet"
-            )
-            print(
-                colorize(
-                    f"[WAIT] Stream active | last_tick={last_tick} | last_candle={last_candle} | waiting for next strong signal...",
-                    YELLOW,
-                )
-            )
 
     def _start_countdown(self) -> None:
         if self._countdown_started:
@@ -272,3 +240,4 @@ class MarketDataService:
             f"| O:{candle.open:.2f} H:{candle.high:.2f} "
             f"L:{candle.low:.2f} C:{candle.close:.2f} V:{candle.volume}"
         )
+

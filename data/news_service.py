@@ -92,3 +92,11 @@ class NewsCacheService:
 
         articles = payload.get("articles", [])[:5]
         return [str(article.get("title", "")).strip() for article in articles if article.get("title")]
+
+    @staticmethod
+    def disabled_sentiment() -> dict[str, object]:
+        return {
+            "sentiment": "SIDEWAYS",
+            "confidence": 0.0,
+            "reason": "market_type_without_sentiment",
+        }

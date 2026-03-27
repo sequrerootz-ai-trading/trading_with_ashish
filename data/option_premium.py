@@ -6,10 +6,10 @@ from datetime import date
 
 from kiteconnect import KiteConnect
 
-from execution.option_selector import get_current_weekly_expiry, round_to_nearest_strike
-
 
 logger = logging.getLogger(__name__)
+OPTION_EXCHANGES = ("NFO", "BFO")
+OPTION_SEGMENTS = {"NFO": "NFO-OPT", "BFO": "BFO-OPT"}
 
 
 @dataclass(frozen=True)
@@ -17,12 +17,27 @@ class PremiumQuote:
     trading_symbol: str
     last_price: float
     exchange: str = "NFO"
+    strike: int | None = None
+    option_type: str | None = None
 
 
 class OptionPremiumService:
-    def __init__(self, kite: KiteConnect) -> None:
+    def __init__(self, kite: KiteConnect, market_type: str = "EQUITY") -> None:
         self.kite = kite
-        self._nfo_instruments: list[dict] | None = None
+        self.market_type = market_type
+        self._instrument_cache: dict[str, list[dict]] = {}
+
+    def get_contract_quote(self, trading_symbol: str, exchange: str) -> PremiumQuote | None:
+        exchange_symbol = f"{exchange}:{trading_symbol}"
+        ltp_response = self.kite.ltp(exchange_symbol)
+        quote = ltp_response.get(exchange_symbol)
+        if not quote:
+            return None
+        return PremiumQuote(
+            trading_symbol=trading_symbol,
+            last_price=float(quote["last_price"]),
+            exchange=exchange,
+        )
 
     def get_premium_quote(
         self,
@@ -31,53 +46,115 @@ class OptionPremiumService:
         signal: str,
         reference_date: date | None = None,
     ) -> PremiumQuote | None:
-        normalized_symbol = symbol.upper()
-        if normalized_symbol not in {"NIFTY", "BANKNIFTY"}:
+        if self.market_type != "EQUITY":
             return None
 
+        normalized_symbol = symbol.strip().upper()
         instrument_type = "CE" if signal.upper() == "CALL" else "PE"
-        strike = round_to_nearest_strike(normalized_symbol, spot_price)
-        expiry = get_current_weekly_expiry(reference_date)
-
-        instrument = self._resolve_option_instrument(
+        option_contract = self._select_option_contract(
             symbol=normalized_symbol,
-            strike=strike,
-            expiry=expiry,
+            spot_price=spot_price,
             instrument_type=instrument_type,
+            reference_date=reference_date or date.today(),
         )
-        if instrument is None:
+        if option_contract is None:
             return None
 
-        exchange_symbol = f"NFO:{instrument['tradingsymbol']}"
+        exchange_symbol = f"{option_contract['exchange']}:{option_contract['tradingsymbol']}"
         ltp_response = self.kite.ltp(exchange_symbol)
         quote = ltp_response.get(exchange_symbol)
         if not quote:
             return None
 
+        normalized_strike = _normalized_option_strike(option_contract)
         return PremiumQuote(
-            trading_symbol=instrument["tradingsymbol"],
+            trading_symbol=str(option_contract["tradingsymbol"]),
             last_price=float(quote["last_price"]),
+            exchange=str(option_contract["exchange"]),
+            strike=int(normalized_strike) if normalized_strike is not None else None,
+            option_type=instrument_type,
         )
 
-    def _resolve_option_instrument(
+    def _select_option_contract(
         self,
         symbol: str,
-        strike: int,
-        expiry: date,
+        spot_price: float,
         instrument_type: str,
+        reference_date: date,
     ) -> dict | None:
-        if self._nfo_instruments is None:
-            self._nfo_instruments = self.kite.instruments(exchange="NFO")
-
-        return next(
-            (
+        candidates: list[dict] = []
+        for exchange in OPTION_EXCHANGES:
+            instruments = self._load_instruments(exchange)
+            segment = OPTION_SEGMENTS[exchange]
+            candidates.extend(
                 row
-                for row in self._nfo_instruments
-                if row.get("name") == symbol
-                and row.get("segment") == "NFO-OPT"
-                and int(float(row.get("strike") or 0)) == strike
-                and row.get("instrument_type") == instrument_type
-                and row.get("expiry") == expiry
-            ),
-            None,
+                for row in instruments
+                if str(row.get("segment") or "").upper() == segment
+                and str(row.get("instrument_type") or "").upper() == instrument_type
+                and _option_name_matches(row, symbol)
+                and row.get("expiry") is not None
+                and float(row.get("strike") or 0) > 0
+            )
+
+        if not candidates:
+            return None
+
+        valid_expiries = sorted({row["expiry"] for row in candidates if row["expiry"] >= reference_date})
+        if not valid_expiries:
+            valid_expiries = sorted({row["expiry"] for row in candidates})
+        if not valid_expiries:
+            return None
+
+        nearest_expiry = valid_expiries[0]
+        expiry_candidates = [row for row in candidates if row.get("expiry") == nearest_expiry]
+        expiry_candidates.sort(
+            key=lambda row: (
+                abs((_normalized_option_strike(row) or spot_price) - spot_price),
+                0 if str(row.get("exchange") or "").upper() == "NFO" else 1,
+                str(row.get("tradingsymbol") or ""),
+            )
         )
+        return expiry_candidates[0] if expiry_candidates else None
+
+    def _load_instruments(self, exchange: str) -> list[dict]:
+        instruments = self._instrument_cache.get(exchange)
+        if instruments is None:
+            instruments = self.kite.instruments(exchange=exchange)
+            self._instrument_cache[exchange] = instruments
+        return instruments
+
+
+def _option_name_matches(row: dict, symbol: str) -> bool:
+    tradingsymbol = str(row.get("tradingsymbol") or "").upper()
+    name = str(row.get("name") or "").upper()
+    return name == symbol or tradingsymbol.startswith(symbol)
+
+
+def _normalized_option_strike(row: dict) -> float | None:
+    raw_strike = row.get("strike")
+    if raw_strike is not None:
+        try:
+            strike_value = float(raw_strike)
+            if strike_value > 0:
+                if strike_value >= 100000:
+                    return strike_value / 100
+                return strike_value
+        except (TypeError, ValueError):
+            pass
+
+    tradingsymbol = str(row.get("tradingsymbol") or "").upper()
+    option_type = str(row.get("instrument_type") or "").upper()
+    suffix = option_type if option_type in {"CE", "PE"} else ""
+    if suffix and tradingsymbol.endswith(suffix):
+        tradingsymbol = tradingsymbol[: -len(suffix)]
+
+    digits: list[str] = []
+    for char in reversed(tradingsymbol):
+        if char.isdigit():
+            digits.append(char)
+        elif digits:
+            break
+    if not digits:
+        return None
+
+    return float("".join(reversed(digits)))

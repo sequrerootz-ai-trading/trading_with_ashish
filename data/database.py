@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 from data.candle_store import Candle
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = BASE_DIR / "trading_system.db"
+load_dotenv(BASE_DIR / ".env", override=False)
 
 
 @dataclass(frozen=True)
@@ -212,7 +216,8 @@ class TradingDatabase:
     @staticmethod
     def _row_to_candle(row: sqlite3.Row) -> Candle:
         end = datetime.fromisoformat(str(row['timestamp']))
-        start = end - timedelta(minutes=5)
+        timeframe_minutes = int(os.getenv("CANDLE_INTERVAL_MINUTES", "3"))
+        start = end - timedelta(minutes=timeframe_minutes)
         return Candle(
             symbol=str(row['symbol']),
             start=start,

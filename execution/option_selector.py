@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+import calendar
 
 
 STEP_SIZE_BY_INDEX = {
     "NIFTY": 50,
     "BANKNIFTY": 100,
+    "SENSEX": 100,
 }
 
 OPTION_TYPE_BY_SIGNAL = {
@@ -48,10 +50,16 @@ def round_to_nearest_strike(index_name: str, index_price: float) -> int:
     return int(round(index_price / step_size) * step_size)
 
 
-def get_current_weekly_expiry(reference_date: date | None = None) -> date:
+def get_current_weekly_expiry(index_name: str, reference_date: date | None = None) -> date:
     current_date = reference_date or date.today()
-    days_until_thursday = (3 - current_date.weekday()) % 7
-    return current_date + timedelta(days=days_until_thursday)
+    normalized_index = index_name.upper()
+    if normalized_index == "NIFTY":
+        return _next_weekday(current_date, 1)
+    if normalized_index == "SENSEX":
+        return _next_weekday(current_date, 3)
+    if normalized_index == "BANKNIFTY":
+        return _last_weekday_of_month(current_date, 1)
+    raise ValueError(f"Unsupported index: {index_name}")
 
 
 def build_option_trading_symbol(
@@ -67,7 +75,7 @@ def build_option_trading_symbol(
         raise ValueError(f"Unsupported signal: {signal}")
 
     strike = round_to_nearest_strike(normalized_index, index_price)
-    expiry = get_current_weekly_expiry(reference_date=reference_date)
+    expiry = get_current_weekly_expiry(normalized_index, reference_date=reference_date)
     option_type = OPTION_TYPE_BY_SIGNAL[normalized_signal]
     expiry_code = f"{expiry:%y}{MONTH_CODES[expiry.month]}{expiry.day:02d}"
 
@@ -86,7 +94,7 @@ def select_option_contract(
     if normalized_signal not in OPTION_TYPE_BY_SIGNAL:
         raise ValueError(f"Unsupported signal: {signal}")
 
-    expiry = get_current_weekly_expiry(reference_date=reference_date)
+    expiry = get_current_weekly_expiry(normalized_index, reference_date=reference_date)
     strike = round_to_nearest_strike(normalized_index, index_price)
     option_type = OPTION_TYPE_BY_SIGNAL[normalized_signal]
     trading_symbol = build_option_trading_symbol(

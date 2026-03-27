@@ -8,7 +8,7 @@ from typing import Any
 from kiteconnect import KiteConnect
 
 from config import get_mode
-from config.settings import ExecutionSettings
+from config.settings import ExecutionSettings, InstrumentConfig
 from execution.trade_manager import TradeManager
 
 
@@ -32,10 +32,12 @@ class OrderManager:
         self,
         kite: KiteConnect | None,
         settings: ExecutionSettings,
+        instrument: InstrumentConfig | None = None,
         trade_manager: TradeManager | None = None,
     ) -> None:
         self.kite = kite
         self.settings = settings
+        self.instrument = instrument
         self.mode = get_mode()
         self.trade_manager = trade_manager or TradeManager()
         self._paper_orders: dict[str, dict[str, Any]] = {}
@@ -45,8 +47,13 @@ class OrderManager:
         if last_price <= 0:
             raise ValueError("Last price must be greater than 0 for quantity calculation.")
 
-        quantity = int(self.settings.capital_per_trade // last_price)
-        return max(quantity, 1)
+        lot_size = self.instrument.lot_size if self.instrument is not None else 1
+        units = int(self.settings.capital_per_trade // last_price)
+        if lot_size <= 1:
+            return max(units, 1)
+
+        lots = max(units // lot_size, 1)
+        return lots * lot_size
 
     def place_market_buy(
         self,
@@ -68,7 +75,7 @@ class OrderManager:
             )
 
         self._ensure_live_ready()
-        print("⚠️ LIVE MODE ACTIVE - REAL MONEY TRADE")
+        print("LIVE MODE ACTIVE - REAL MONEY TRADE")
         entry_order_id = self._with_retry(
             lambda: self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
@@ -273,7 +280,8 @@ class OrderManager:
     def _calculate_stop_loss_price(self, entry_price: float, percent: float | None = None) -> float:
         stop_loss_percent = percent if percent is not None else self.settings.stop_loss_percent
         raw_price = entry_price * (1 - stop_loss_percent)
-        return self._round_to_tick(raw_price)
+        tick_size = self.instrument.tick_size if self.instrument is not None else 0.05
+        return self._round_to_tick(raw_price, tick_size=tick_size)
 
     def _ensure_live_ready(self) -> None:
         if self.mode != "LIVE":

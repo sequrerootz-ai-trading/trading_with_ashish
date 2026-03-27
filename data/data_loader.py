@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -8,6 +9,7 @@ from zoneinfo import ZoneInfo
 from data.candle_store import Candle
 from data.database import TradingDatabase
 from data.market_data import MarketDataService
+from strategy.strategy import MINIMUM_INDICATOR_CANDLES
 
 
 logger = logging.getLogger(__name__)
@@ -31,18 +33,25 @@ class HistoricalDataLoader:
         self.market_data = market_data
         self.database = database
 
-    def fetch_historical_candles(self, symbol: str) -> list[Candle]:
+    def fetch_historical_candles(self, symbol: str, market_type: str | None = None) -> list[Candle]:
         instrument = self.market_data.get_resolved_instrument(symbol)
-        session_start, session_end = session_window_ist()
+        timeframe_minutes = self.market_data.settings.candle_interval_minutes
+        normalized_market_type = market_type or self.market_data.settings.market_type
+        session_start, session_end = session_window_ist(
+            normalized_market_type,
+            timeframe_minutes=timeframe_minutes,
+        )
+        recent_window_start = history_window_start_ist(
+            session_end=session_end,
+            market_type=normalized_market_type,
+            timeframe_minutes=timeframe_minutes,
+            candle_count=MAX_STARTUP_CANDLES,
+        )
 
         try:
-            cached = self.database.get_market_data_range(
-                symbol=symbol,
-                start=session_start,
-                end=session_end,
-                limit=MAX_STARTUP_CANDLES,
-            )
-            if cached and self._covers_session(cached, session_end):
+            cached = self.database.get_recent_candles(symbol=symbol, limit=MAX_STARTUP_CANDLES)
+            cached = [candle for candle in cached if candle.end <= session_end]
+            if len(cached) >= MINIMUM_INDICATOR_CANDLES:
                 logger.info(
                     "Using cached historical candles for %s | count=%s",
                     symbol,
@@ -57,13 +66,13 @@ class HistoricalDataLoader:
             try:
                 rows = self.market_data.clients.kite.historical_data(
                     instrument_token=instrument.instrument_token,
-                    from_date=session_start,
+                    from_date=recent_window_start,
                     to_date=session_end,
-                    interval="5minute",
+                    interval=f"{timeframe_minutes}minute",
                     continuous=False,
                     oi=False,
                 )
-                candles = [_row_to_candle(symbol, row) for row in rows]
+                candles = [_row_to_candle(symbol, row, timeframe_minutes) for row in rows]
                 for candle in candles:
                     try:
                         self.database.store_market_data(candle)
@@ -71,10 +80,11 @@ class HistoricalDataLoader:
                         logger.warning("Historical candle store failed for %s: %s", symbol, db_exc)
                         break
                 logger.info(
-                    "Fetched historical candles for %s | count=%s | attempt=%s",
+                    "Fetched historical candles for %s | count=%s | attempt=%s | session_start=%s",
                     symbol,
                     len(candles),
                     attempt,
+                    session_start.isoformat(),
                 )
                 return candles[-MAX_STARTUP_CANDLES:]
             except Exception as exc:
@@ -91,12 +101,8 @@ class HistoricalDataLoader:
             logger.warning("Historical fetch exhausted for %s, using partial cache if available.", symbol)
 
         try:
-            cached = self.database.get_market_data_range(
-                symbol=symbol,
-                start=session_start,
-                end=session_end,
-                limit=MAX_STARTUP_CANDLES,
-            )
+            cached = self.database.get_recent_candles(symbol=symbol, limit=MAX_STARTUP_CANDLES)
+            cached = [candle for candle in cached if candle.end <= session_end]
             return cached[-MAX_STARTUP_CANDLES:]
         except Exception:
             return []
@@ -104,7 +110,10 @@ class HistoricalDataLoader:
     def initialize_candles(self) -> list[HistoricalLoadResult]:
         results: list[HistoricalLoadResult] = []
         for instrument in self.market_data.resolved_instruments:
-            candles = self.fetch_historical_candles(instrument.label)
+            candles = self.fetch_historical_candles(
+                instrument.label,
+                market_type=self.market_data.settings.market_type,
+            )
             source = "historical_or_cache" if candles else "empty"
             results.append(
                 HistoricalLoadResult(
@@ -122,31 +131,56 @@ class HistoricalDataLoader:
         return candles[-1].end >= session_end
 
 
-def session_window_ist(now: datetime | None = None) -> tuple[datetime, datetime]:
+def session_window_ist(
+    market_type: str,
+    timeframe_minutes: int,
+    now: datetime | None = None,
+) -> tuple[datetime, datetime]:
     current_ist = (now or datetime.now(IST)).astimezone(IST)
-    session_start = current_ist.replace(
-        hour=MARKET_OPEN_HOUR,
-        minute=MARKET_OPEN_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    last_completed_end = round_down_to_last_completed_5m(current_ist)
+    if market_type == "MCX":
+        session_start = current_ist.replace(
+            hour=9,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    else:
+        session_start = current_ist.replace(
+            hour=MARKET_OPEN_HOUR,
+            minute=MARKET_OPEN_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+    last_completed_end = round_down_to_last_completed_interval(current_ist, timeframe_minutes)
     return session_start.astimezone(UTC).replace(tzinfo=None), last_completed_end.astimezone(UTC).replace(tzinfo=None)
 
 
-def round_down_to_last_completed_5m(current_time: datetime) -> datetime:
-    minute_bucket = current_time.minute - (current_time.minute % 5)
+def history_window_start_ist(
+    session_end: datetime,
+    market_type: str,
+    timeframe_minutes: int,
+    candle_count: int,
+) -> datetime:
+    # Pull a wider history window so startup has enough closed candles even
+    # early in the session or after a temporary cache miss.
+    candles_per_day = 125 if market_type == "EQUITY" else 240
+    lookback_days = max(2, math.ceil(candle_count / candles_per_day) + 1)
+    return session_end - timedelta(days=lookback_days)
+
+
+def round_down_to_last_completed_interval(current_time: datetime, timeframe_minutes: int) -> datetime:
+    minute_bucket = current_time.minute - (current_time.minute % timeframe_minutes)
     bucket_end = current_time.replace(minute=minute_bucket, second=0, microsecond=0)
     if bucket_end == current_time.replace(second=0, microsecond=0):
-        bucket_end -= timedelta(minutes=5)
+        bucket_end -= timedelta(minutes=timeframe_minutes)
     return bucket_end
 
 
-def _row_to_candle(symbol: str, row: dict) -> Candle:
+def _row_to_candle(symbol: str, row: dict, timeframe_minutes: int) -> Candle:
     end = row["date"]
     if getattr(end, "tzinfo", None) is not None:
         end = end.astimezone(UTC).replace(tzinfo=None)
-    start = end - timedelta(minutes=5)
+    start = end - timedelta(minutes=timeframe_minutes)
     return Candle(
         symbol=symbol,
         start=start,
