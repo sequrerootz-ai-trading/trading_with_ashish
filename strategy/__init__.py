@@ -15,6 +15,7 @@ from strategy.signal_engine import (
     store_signal,
 )
 from strategy.signal_generator import FinalSignal, generate_final_signal
+from strategy.nifty_hybrid import generate_nifty_hybrid_signal
 from strategy.signal_types import GeneratedSignal, SignalContext
 from strategy.strategy import LastClosedCandleStrategy
 from strategy.strategy_equity import generate_equity_signal
@@ -34,6 +35,7 @@ __all__ = [
     "detect_trend",
     "generate_equity_signal",
     "generate_final_signal",
+    "generate_nifty_hybrid_signal",
     "generate_mcx_signal",
     "generate_signal",
     "get_last_closed_candle",

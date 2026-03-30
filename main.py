@@ -15,11 +15,13 @@ from data.option_premium import OptionPremiumService
 from execution.order_manager import OrderManager
 from execution.trade_manager import ActiveTrade, TradeManager
 from strategy.equity_decision_engine import enrich_signal_with_premium
+from strategy.indicators import calculate_ema
 from strategy.market_regime import MarketRegimeSnapshot, detect_market_regime
 from strategy.signal_engine import store_market_data, store_signal
 from strategy.strategy import LastClosedCandleStrategy, MINIMUM_INDICATOR_CANDLES
 
 
+# NEW: daily runtime controls and risk throttles
 DAILY_STATE = {
     "date": None,
     "daily_pnl": 0.0,
@@ -28,8 +30,10 @@ DAILY_STATE = {
     "cooldown_candles": 0,
     "consecutive_losses": 0,
     "halted_for_day": False,
+    "last_trade_pnl": 0.0,
 }
 RUNTIME_SETTINGS: Settings | None = None
+RUNTIME_DATABASE: TradingDatabase | None = None
 
 
 def configure_logging() -> None:
@@ -42,7 +46,7 @@ def configure_logging() -> None:
 
 def main() -> None:
     configure_logging()
-    global RUNTIME_SETTINGS
+    global RUNTIME_SETTINGS, RUNTIME_DATABASE
     mode = get_mode()
     settings = get_settings()
     RUNTIME_SETTINGS = settings
@@ -52,11 +56,13 @@ def main() -> None:
 
     logging.info("Runtime MODE=%s", mode)
     logging.info("Runtime MARKET_TYPE=%s", market_type)
+    logging.info("Runtime EXECUTION_PROFILE=%s", settings.execution_profile)
     logging.info("[INFO] Processing SYMBOL: %s", symbol)
     logging.info("[INFO] Sentiment and news integrations disabled for fast execution.")
 
     market_data = MarketDataService(settings=settings)
     database = TradingDatabase()
+    RUNTIME_DATABASE = database
     candle_manager = CandleManager(max_candles=100)
     loader = HistoricalDataLoader(market_data, database)
     premium_service = OptionPremiumService(market_data.clients.kite, market_type=market_type)
@@ -195,9 +201,6 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, spo
         atr_spike_multiplier=settings.atr_spike_multiplier,
         range_compression_threshold_pct=settings.range_compression_threshold_pct,
     )
-    if regime_snapshot.regime == "SIDEWAYS":
-        _print_skip("Sideways market")
-        return
 
     if generated_signal.signal == "BUY_CE":
         premium = _safe_premium_quote(premium_service, symbol, spot_price, "CALL")
@@ -257,11 +260,17 @@ def _register_trade_plan(
     planned_stop_loss = _planned_stop_loss(
         generated_signal.signal,
         premium.last_price,
-        option.stop_loss,
+        generated_signal.stop_loss if generated_signal.stop_loss is not None else option.stop_loss,
         candle_manager.get_closed_candles(symbol),
         regime_snapshot,
     )
-    rr_ratio = _calculate_rr(option.entry_high, planned_stop_loss, option.entry_high + abs(option.entry_high - planned_stop_loss))
+    signal_entry_price = generated_signal.entry_price if generated_signal.entry_price is not None else option.entry_high
+    signal_target_price = generated_signal.target if generated_signal.target is not None else option.target
+    rr_ratio = _calculate_rr(
+        signal_entry_price,
+        planned_stop_loss,
+        signal_target_price if signal_target_price is not None else signal_entry_price + abs(signal_entry_price - planned_stop_loss),
+    )
     last_candle = candle_manager.get_last_completed_candle(symbol)
     return trade_manager.open_trade_plan(
         symbol=symbol,
@@ -276,6 +285,7 @@ def _register_trade_plan(
         regime=regime_snapshot.regime,
         entry_reason=generated_signal.reason,
         rr_ratio=rr_ratio,
+        target_price=signal_target_price,
         confirmation_high=(last_candle.high if last_candle is not None else None),
         confirmation_low=(last_candle.low if last_candle is not None else None),
     )
@@ -299,6 +309,9 @@ def _manage_active_trade(symbol: str, trade_manager: TradeManager, premium_servi
         return True
 
     current_price = premium.last_price
+    if active_trade.status == "OPEN":
+        active_trade = _refresh_trade_extremes(active_trade, current_price, trade_manager) or active_trade
+
     if active_trade.status == "PENDING_ENTRY":
         if current_price < active_trade.initial_stop_loss:
             closed_trade = trade_manager.close_active_trade(symbol, "entry_failed_below_stop", current_price)
@@ -335,7 +348,7 @@ def _manage_active_trade(symbol: str, trade_manager: TradeManager, premium_servi
     active_trade = partial_trade or trade_manager.get_active_trade(symbol) or active_trade
 
     if _should_time_exit(active_trade, current_price):
-        exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=active_trade.remaining_quantity or active_trade.quantity)
+        exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=active_trade.remaining_quantity or active_trade.quantity, reason="time_exit")
         if exit_order is None:
             return True
         exit_price = _extract_order_price(exit_order, current_price)
@@ -346,7 +359,7 @@ def _manage_active_trade(symbol: str, trade_manager: TradeManager, premium_servi
         return True
 
     if current_price <= active_trade.stop_loss:
-        exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=active_trade.remaining_quantity or active_trade.quantity)
+        exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=active_trade.remaining_quantity or active_trade.quantity, reason="stop_loss_hit")
         if exit_order is None:
             return True
         exit_price = _extract_order_price(exit_order, current_price)
@@ -387,6 +400,8 @@ def _try_execute_entry_if_needed(symbol: str, active_trade: ActiveTrade, current
             quantity=managed_order.quantity,
             remaining_quantity=managed_order.quantity,
             highest_price=managed_order.entry_price,
+            mfe_price=managed_order.entry_price,
+            mae_price=managed_order.entry_price,
             order_placed=True,
             entry_order_id=managed_order.entry_order_id,
             stop_loss_order_id=managed_order.stop_loss_order_id,
@@ -423,6 +438,8 @@ def _handle_live_stop_loss_completion(symbol: str, active_trade: ActiveTrade, cu
             quantity=active_trade.remaining_quantity or active_trade.quantity,
             price=exit_price,
             status="STOP_LOSS_FILLED",
+            reason="stop_loss_hit",
+            order_id=active_trade.stop_loss_order_id,
         )
         closed_trade = trade_manager.close_active_trade(symbol, "stop_loss_hit", exit_price)
         if closed_trade is not None:
@@ -432,7 +449,7 @@ def _handle_live_stop_loss_completion(symbol: str, active_trade: ActiveTrade, cu
 
     if stop_status in {"REJECTED", "CANCELLED"} and current_price <= active_trade.stop_loss:
         _print_order_error(f"Stop-loss order {stop_status.lower()} for {active_trade.trading_symbol}. Exiting at market.")
-        exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=active_trade.remaining_quantity or active_trade.quantity)
+        exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=active_trade.remaining_quantity or active_trade.quantity, reason="emergency_stop_loss_exit")
         if exit_order is None:
             return True
         exit_price = _extract_order_price(exit_order, current_price)
@@ -445,7 +462,13 @@ def _handle_live_stop_loss_completion(symbol: str, active_trade: ActiveTrade, cu
     return False
 
 
-def _safe_exit_position(active_trade: ActiveTrade, current_price: float, order_manager: OrderManager, quantity: int | None = None):
+def _safe_exit_position(
+    active_trade: ActiveTrade,
+    current_price: float,
+    order_manager: OrderManager,
+    quantity: int | None = None,
+    reason: str = "manual_exit",
+):
     try:
         exit_quantity = quantity or active_trade.remaining_quantity or active_trade.quantity
         if order_manager.mode == "LIVE" and active_trade.stop_loss_order_id:
@@ -458,6 +481,7 @@ def _safe_exit_position(active_trade: ActiveTrade, current_price: float, order_m
             exchange=active_trade.exchange,
             quantity=exit_quantity,
             last_price=current_price,
+            reason=reason,
         )
     except Exception as exc:
         logging.exception("Exit order failed for %s", active_trade.trading_symbol)
@@ -472,20 +496,25 @@ def _trail_active_trade_if_needed(active_trade: ActiveTrade, current_price: floa
 
     settings = _execution_settings()
     highest_price = max(active_trade.highest_price or entry_price, current_price)
-    profit_pct = ((current_price - entry_price) / entry_price) if entry_price > 0 else 0.0
+    initial_risk = max(entry_price - active_trade.initial_stop_loss, 0.01)
+    reward_multiple = max((highest_price - entry_price) / initial_risk, 0.0)
 
-    new_stop_loss = active_trade.stop_loss
-    if profit_pct >= 0.10:
-        new_stop_loss = max(new_stop_loss, active_trade.entry_low)
-    if profit_pct >= 0.25:
-        new_stop_loss = max(new_stop_loss, entry_price)
-    if profit_pct >= 0.40:
-        new_stop_loss = max(new_stop_loss, entry_price * 1.20)
-    if settings.trailing_mode == "PREVIOUS_CANDLE" and latest_candle is not None:
-        new_stop_loss = max(new_stop_loss, float(latest_candle.low))
-    elif settings.trailing_mode == "FIXED_STEP":
-        step_stop = highest_price * (1.0 - settings.fixed_trail_step_pct)
-        new_stop_loss = max(new_stop_loss, step_stop)
+    locked_stop = active_trade.stop_loss
+    if reward_multiple >= 1.0:
+        locked_stop = max(locked_stop, entry_price)
+    if reward_multiple >= 1.5:
+        locked_stop = max(locked_stop, entry_price + (initial_risk * 0.5))
+    if reward_multiple >= 2.0:
+        locked_stop = max(locked_stop, entry_price + initial_risk)
+
+    if settings.trailing_mode == "FIXED_STEP":
+        trailing_candidate = highest_price * (1.0 - settings.fixed_trail_step_pct)
+    else:
+        trailing_buffer = max(highest_price * settings.trailing_buffer_pct, initial_risk * settings.trailing_rr_lock_step)
+        trailing_candidate = highest_price - trailing_buffer
+
+    new_stop_loss = max(active_trade.stop_loss, locked_stop, trailing_candidate)
+    new_stop_loss = min(new_stop_loss, current_price * 0.995)
 
     if highest_price <= (active_trade.highest_price or entry_price) and new_stop_loss <= active_trade.stop_loss:
         return active_trade
@@ -525,10 +554,10 @@ def _print_trade_started(active_trade: ActiveTrade) -> None:
         f"Bought {active_trade.trading_symbol} at {_fmt_rupee(active_trade.entry_price or active_trade.entry_high)}",
         f"Qty: {active_trade.quantity}",
         f"Initial SL: {_fmt_rupee(active_trade.stop_loss)}",
+        f"Target: {_fmt_rupee(active_trade.target_price)}" if active_trade.target_price is not None else "Target: Open",
         f"Regime: {active_trade.regime} | RR: {active_trade.rr_ratio:.2f}",
     ]
     print(colorize("\n".join(lines), _mode_color(), bold=True))
-
 
 def _print_trade_waiting(active_trade: ActiveTrade, current_price: float) -> None:
     lines = [
@@ -555,8 +584,9 @@ def _print_trade_running(active_trade: ActiveTrade, current_price: float) -> Non
         f"[{_mode_label()} TRADE RUNNING]",
         f"LTP: {_fmt_rupee(current_price)} | SL: {_fmt_rupee(active_trade.stop_loss)} | PnL: {pnl_text}",
     ]
+    if active_trade.target_price is not None:
+        lines.append(f"Target: {_fmt_rupee(active_trade.target_price)} | Realized: {_fmt_rupee(active_trade.realized_pnl)}")
     print(colorize("\n".join(lines), _mode_color(), bold=True))
-
 
 def _print_stop_loss_hit(active_trade: ActiveTrade, exit_price: float) -> None:
     pnl_text = _format_pnl_pct(active_trade.entry_price, exit_price)
@@ -736,6 +766,17 @@ def _parse_reason_details(reason: str) -> dict[str, str]:
     }
 
 
+def _refresh_trade_extremes(active_trade: ActiveTrade, current_price: float, trade_manager: TradeManager) -> ActiveTrade | None:
+    entry_anchor = active_trade.entry_price or current_price
+    mfe_price = max(active_trade.mfe_price or entry_anchor, current_price)
+    mae_price = min(active_trade.mae_price or entry_anchor, current_price)
+    return trade_manager.update_active_trade(
+        symbol=active_trade.symbol,
+        mfe_price=mfe_price,
+        mae_price=mae_price,
+    )
+
+
 def _default_sentiment() -> dict[str, object]:
     return {
         "sentiment": "SIDEWAYS",
@@ -775,6 +816,7 @@ def _reset_daily_state_if_needed() -> None:
     DAILY_STATE["cooldown_candles"] = 0
     DAILY_STATE["consecutive_losses"] = 0
     DAILY_STATE["halted_for_day"] = False
+    DAILY_STATE["last_trade_pnl"] = 0.0
 
 
 def _is_trade_window_open(symbol: str) -> bool:
@@ -820,18 +862,128 @@ def _cooldown_active() -> bool:
 
 
 def _should_skip_trade(symbol: str, generated_signal, premium_price: float, candle_manager: CandleManager, regime_snapshot: MarketRegimeSnapshot) -> bool:
+    settings = _execution_settings()
     if not _premium_in_range(premium_price):
         _print_skip("Premium outside allowed range")
         return True
-    if _ema_spread_too_small(generated_signal):
-        _print_skip("Sideways market")
+
+    score, reasons, threshold = _calculate_filter_score(
+        symbol=symbol,
+        generated_signal=generated_signal,
+        premium_price=premium_price,
+        candle_manager=candle_manager,
+        regime_snapshot=regime_snapshot,
+    )
+    if score > threshold:
+        _print_skip(f"High penalty score ({score:.2f}/{threshold:.2f}) | {'; '.join(reasons[:3])}")
+        logging.info(
+            "[FILTER SCORE] Trade rejected due to high penalty | %s | penalty_score=%.2f | threshold=%.2f | reasons=%s",
+            symbol,
+            score,
+            threshold,
+            reasons,
+        )
         return True
-    if _recent_range_too_tight(symbol, candle_manager):
-        _print_skip("Low volatility")
-        return True
-    if not _passes_vwap_volume_filter(symbol, generated_signal.signal, candle_manager, regime_snapshot):
-        return True
+
+    logging.info(
+        "[FILTER SCORE] Trade accepted | %s | penalty_score=%.2f | threshold=%.2f | reasons=%s",
+        symbol,
+        score,
+        threshold,
+        reasons or ["clean_setup"],
+    )
     return False
+
+
+# NEW: adaptive scoring so filters reduce weak trades without killing frequency.
+def _calculate_filter_score(
+    symbol: str,
+    generated_signal,
+    premium_price: float,
+    candle_manager: CandleManager,
+    regime_snapshot: MarketRegimeSnapshot,
+) -> tuple[float, list[str], float]:
+    settings = _execution_settings()
+    penalties: list[tuple[float, str]] = []
+
+    regime_penalty = _regime_penalty(regime_snapshot, settings)
+    if regime_penalty > 0:
+        penalties.append((regime_penalty, f"regime={regime_snapshot.regime.lower()}"))
+
+    ema_penalty = _ema_spread_penalty(generated_signal, settings)
+    if ema_penalty > 0:
+        penalties.append((ema_penalty, "ema_spread_tight"))
+
+    volatility_penalty = _volatility_penalty(symbol, candle_manager, settings)
+    if volatility_penalty > 0:
+        penalties.append((volatility_penalty, "recent_range_compressed"))
+
+    vwap_penalty, volume_penalty, market_reasons = _vwap_volume_penalties(
+        symbol=symbol,
+        signal=generated_signal.signal,
+        candle_manager=candle_manager,
+        regime_snapshot=regime_snapshot,
+        settings=settings,
+    )
+    if vwap_penalty > 0:
+        penalties.append((vwap_penalty, "vwap_misaligned"))
+    if volume_penalty > 0:
+        penalties.append((volume_penalty, "volume_below_confirmation"))
+    for reason in market_reasons:
+        penalties.append((0.0, reason))
+
+    higher_tf_penalty = _higher_timeframe_penalty(symbol, generated_signal.signal, candle_manager, settings)
+    if higher_tf_penalty > 0:
+        penalties.append((higher_tf_penalty, "higher_tf_misaligned"))
+
+    threshold = settings.filter_score_threshold
+    if regime_snapshot.regime == "TRENDING":
+        threshold += settings.filter_score_trending_bonus
+    elif regime_snapshot.regime == "VOLATILE":
+        threshold += settings.filter_score_volatile_bonus
+    elif regime_snapshot.regime == "SIDEWAYS":
+        threshold -= settings.filter_score_sideways_penalty
+
+    confidence = max(0.0, min(float(getattr(generated_signal, "confidence", 0.0) or 0.0), 1.0))
+    threshold += max(confidence - 0.55, 0.0) * settings.filter_confidence_bonus
+
+    raw_score = sum(value for value, _ in penalties)
+    score = round(min(raw_score, settings.max_filter_penalty_cap), 2)
+    reasons = [reason for _, reason in penalties if reason]
+    return score, reasons, round(max(threshold, 1.0), 2)
+
+
+# NEW: optional higher timeframe trend gate without changing core signals
+def _higher_timeframe_penalty(symbol: str, signal: str, candle_manager: CandleManager, settings) -> float:
+    if not settings.enable_higher_timeframe_trend_filter:
+        return 0.0
+    candles = candle_manager.get_closed_candles(symbol)
+    aggregated_closes = _aggregate_higher_timeframe_closes(candles, settings.higher_timeframe_multiple)
+    if len(aggregated_closes) < settings.higher_timeframe_slow_ema:
+        return 0.0
+
+    fast_ema = calculate_ema(aggregated_closes, settings.higher_timeframe_fast_ema)
+    slow_ema = calculate_ema(aggregated_closes, settings.higher_timeframe_slow_ema)
+    if fast_ema is None or slow_ema is None:
+        return 0.0
+
+    ema_distance_pct = abs(fast_ema - slow_ema) / max(abs(slow_ema), 0.01)
+    severity = min(max(0.25 + (ema_distance_pct / 0.003), 0.25), 1.0)
+    if signal == "BUY_CE" and fast_ema <= slow_ema:
+        return round(severity * settings.filter_higher_tf_weight, 2)
+    if signal == "BUY_PE" and fast_ema >= slow_ema:
+        return round(severity * settings.filter_higher_tf_weight, 2)
+    return 0.0
+
+
+def _regime_penalty(regime_snapshot: MarketRegimeSnapshot, settings) -> float:
+    if regime_snapshot.regime == "SIDEWAYS":
+        base_penalty = settings.filter_sideways_weight
+        volume_ratio = regime_snapshot.volume_spike_ratio or 0.0
+        if volume_ratio >= settings.volume_spike_multiplier:
+            return round(base_penalty * 0.35, 2)
+        return round(base_penalty, 2)
+    return 0.0
 
 
 def _premium_in_range(premium_price: float) -> bool:
@@ -840,31 +992,51 @@ def _premium_in_range(premium_price: float) -> bool:
 
 
 def _ema_spread_too_small(generated_signal) -> bool:
+    return _ema_spread_penalty(generated_signal, _execution_settings()) > 0.75
+
+
+def _ema_spread_penalty(generated_signal, settings) -> float:
     details = getattr(generated_signal, "details", None)
     indicator = getattr(details, "indicator_details", None)
     ema_9 = getattr(indicator, "ema_9", None)
     ema_21 = getattr(indicator, "ema_21", None)
     if ema_9 is None or ema_21 is None:
-        return False
-    return abs(float(ema_9) - float(ema_21)) < _env_float("EMA_SPREAD_THRESHOLD", 5.0)
+        return 0.0
+    threshold = _env_float("EMA_SPREAD_THRESHOLD", 5.0)
+    spread = abs(float(ema_9) - float(ema_21))
+    if spread >= threshold:
+        return 0.0
+    shortfall_ratio = 1.0 - (spread / max(threshold, 0.01))
+    return round(shortfall_ratio * settings.filter_ema_weight, 2)
 
 
 def _recent_range_too_tight(symbol: str, candle_manager: CandleManager) -> bool:
+    return _volatility_penalty(symbol, candle_manager, _execution_settings()) > 0.75
+
+
+def _volatility_penalty(symbol: str, candle_manager: CandleManager, settings) -> float:
     candles = candle_manager.get_closed_candles(symbol)[-5:]
     if len(candles) < 5:
-        return False
+        return 0.0
     highest_high = max(float(candle.high) for candle in candles)
     lowest_low = min(float(candle.low) for candle in candles)
-    threshold_pct = _execution_settings().range_compression_threshold_pct
+    threshold_pct = settings.range_compression_threshold_pct
     reference_price = max(float(candles[-1].close), 0.01)
-    return ((highest_high - lowest_low) / reference_price) < threshold_pct
+    actual_range_pct = (highest_high - lowest_low) / reference_price
+    if actual_range_pct >= threshold_pct:
+        return 0.0
+    shortfall_ratio = 1.0 - (actual_range_pct / max(threshold_pct, 0.0001))
+    return round(shortfall_ratio * settings.filter_volatility_weight, 2)
 
 
+# IMPROVED: persist trade analytics and update live performance stats
 def _record_trade_result(active_trade: ActiveTrade, exit_price: float) -> None:
     entry_price = active_trade.entry_price or 0.0
     exited_quantity = active_trade.remaining_quantity or active_trade.quantity
-    pnl_amount = (exit_price - entry_price) * exited_quantity
-    DAILY_STATE["daily_pnl"] = float(DAILY_STATE["daily_pnl"]) + pnl_amount
+    running_leg_pnl = (exit_price - entry_price) * exited_quantity
+    pnl_amount = float(active_trade.realized_pnl) + running_leg_pnl
+    DAILY_STATE["daily_pnl"] = float(DAILY_STATE["daily_pnl"]) + running_leg_pnl
+    DAILY_STATE["last_trade_pnl"] = pnl_amount
     DAILY_STATE["peak_pnl"] = max(float(DAILY_STATE["peak_pnl"]), float(DAILY_STATE["daily_pnl"]))
     DAILY_STATE["completed_trades"] = int(DAILY_STATE["completed_trades"]) + 1
     if pnl_amount < 0:
@@ -878,11 +1050,55 @@ def _record_trade_result(active_trade: ActiveTrade, exit_price: float) -> None:
     else:
         DAILY_STATE["consecutive_losses"] = 0
 
+    if RUNTIME_DATABASE is not None and entry_price > 0:
+        opened_at = active_trade.opened_at
+        closed_at = datetime.now().isoformat()
+        pnl_pct = (pnl_amount / max(entry_price * max(active_trade.quantity, 1), 0.01)) * 100.0
+        mfe_pct = None if active_trade.mfe_price is None else ((active_trade.mfe_price - entry_price) / entry_price) * 100.0
+        mae_pct = None if active_trade.mae_price is None else ((active_trade.mae_price - entry_price) / entry_price) * 100.0
+        duration_minutes = None
+        if opened_at is not None:
+            try:
+                duration_minutes = (datetime.fromisoformat(closed_at) - datetime.fromisoformat(opened_at)).total_seconds() / 60.0
+            except ValueError:
+                duration_minutes = None
+        RUNTIME_DATABASE.store_trade_summary(
+            symbol=active_trade.symbol,
+            trading_symbol=active_trade.trading_symbol,
+            signal=active_trade.signal,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=max(active_trade.quantity, 1),
+            pnl=pnl_amount,
+            pnl_pct=pnl_pct,
+            exit_reason=active_trade.exit_reason or "closed",
+            regime=active_trade.regime,
+            entry_reason=active_trade.entry_reason,
+            partial_exit_done=active_trade.partial_exit_done,
+            realized_pnl=active_trade.realized_pnl,
+            rr_ratio=active_trade.rr_ratio,
+            target_price=active_trade.target_price,
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
+            opened_at=opened_at,
+            closed_at=closed_at,
+            duration_minutes=duration_minutes,
+        )
+        metrics = RUNTIME_DATABASE.get_trade_performance(active_trade.symbol)
+        logging.info(
+            "[PERFORMANCE] %s | win_rate=%.2f%% | profit_factor=%.2f | avg_rr=%.2f | max_drawdown=%.2f | net_pnl=%.2f",
+            active_trade.symbol,
+            metrics["win_rate"],
+            metrics["profit_factor"],
+            metrics["avg_rr_proxy"],
+            metrics["max_drawdown"],
+            metrics["net_pnl"],
+        )
 
 def _risk_based_capital(order_manager: OrderManager, base_capital: float, entry_price: float, stop_loss: float) -> float:
     settings = _execution_settings()
     risk_per_trade = max(settings.account_balance * settings.risk_per_trade_pct, 1.0)
-    per_unit_risk = max(entry_price - stop_loss, 0.01)
+    per_unit_risk = max(abs(entry_price - stop_loss), 0.01)
     raw_quantity = max(int(risk_per_trade / per_unit_risk), 1)
     lot_size = order_manager.instrument.lot_size if order_manager.instrument is not None else 1
     if lot_size > 1:
@@ -891,7 +1107,6 @@ def _risk_based_capital(order_manager: OrderManager, base_capital: float, entry_
         risk_quantity = raw_quantity
     capital = min(risk_quantity * entry_price, settings.max_capital_exposure, base_capital)
     return round(capital, 2)
-
 
 def _execution_settings():
     return (RUNTIME_SETTINGS or get_settings()).execution
@@ -909,45 +1124,100 @@ def _compute_entry_quantity(order_manager: OrderManager, active_trade: ActiveTra
     capital_cap = _risk_based_capital(order_manager, settings.capital_per_trade, execution_price, active_trade.stop_loss)
     if active_trade.regime == "VOLATILE":
         capital_cap = min(capital_cap, settings.capital_per_trade * 0.5)
+    drawdown_scale = _drawdown_position_scale()
+    capital_cap = max(capital_cap * drawdown_scale, execution_price)
     capital_qty = order_manager.calculate_quantity(execution_price, capital_override=capital_cap)
-    return max(min(risk_qty, capital_qty), order_manager.instrument.lot_size if order_manager.instrument is not None else 1)
+    base_quantity = min(risk_qty, capital_qty)
+    lot_floor = order_manager.instrument.lot_size if order_manager.instrument is not None else 1
+    return max(base_quantity, lot_floor)
 
+
+def _drawdown_position_scale() -> float:
+    settings = _execution_settings()
+    if settings.max_daily_loss <= 0:
+        return 1.0
+    daily_loss_pressure = abs(min(float(DAILY_STATE["daily_pnl"]), 0.0)) / settings.max_daily_loss
+    scale = 1.0
+    if daily_loss_pressure >= settings.drawdown_size_reduction_start_pct:
+        scale = min(scale, settings.drawdown_size_reduction_factor)
+    if int(DAILY_STATE["consecutive_losses"]) >= 2:
+        scale = min(scale, settings.drawdown_size_reduction_factor)
+    return max(scale, 0.25)
 
 def _passes_vwap_volume_filter(symbol: str, signal: str, candle_manager: CandleManager, regime_snapshot: MarketRegimeSnapshot) -> bool:
+    vwap_penalty, volume_penalty, _ = _vwap_volume_penalties(
+        symbol=symbol,
+        signal=signal,
+        candle_manager=candle_manager,
+        regime_snapshot=regime_snapshot,
+        settings=_execution_settings(),
+    )
+    return (vwap_penalty + volume_penalty) <= 0.75
+
+
+def _vwap_volume_penalties(
+    symbol: str,
+    signal: str,
+    candle_manager: CandleManager,
+    regime_snapshot: MarketRegimeSnapshot,
+    settings,
+) -> tuple[float, float, list[str]]:
     candles = candle_manager.get_closed_candles(symbol)
     if not candles:
-        return True
+        return 0.0, 0.0, []
+
+    reasons: list[str] = []
     last_close = float(candles[-1].close)
     vwap = regime_snapshot.vwap
     volume_spike_ratio = regime_snapshot.volume_spike_ratio
-    settings = _execution_settings()
+    vwap_penalty = 0.0
+    volume_penalty = 0.0
 
-    if signal == "BUY_CE" and vwap is not None and last_close <= vwap:
-        _print_skip("Price below VWAP")
-        return False
-    if signal == "BUY_PE" and vwap is not None and last_close >= vwap:
-        _print_skip("Price above VWAP")
-        return False
-    if volume_spike_ratio is not None and volume_spike_ratio < settings.volume_spike_multiplier:
-        _print_skip("Volume confirmation missing")
-        return False
-    return True
+    if settings.enable_vwap_filter and vwap is not None:
+        distance = abs(last_close - vwap) / max(last_close, 0.01)
+        if signal == "BUY_CE" and last_close <= vwap:
+            severity = min(max(distance / 0.004, 0.2), 1.0)
+            vwap_penalty = round(severity * settings.filter_vwap_weight, 2)
+            reasons.append("price_below_vwap")
+        elif signal == "BUY_PE" and last_close >= vwap:
+            severity = min(max(distance / 0.004, 0.2), 1.0)
+            vwap_penalty = round(severity * settings.filter_vwap_weight, 2)
+            reasons.append("price_above_vwap")
 
+    if settings.enable_volume_filter and volume_spike_ratio is not None and settings.volume_spike_multiplier > 0:
+        if volume_spike_ratio < settings.volume_spike_multiplier:
+            shortfall_ratio = 1.0 - (volume_spike_ratio / settings.volume_spike_multiplier)
+            volume_penalty = round(shortfall_ratio * settings.filter_volume_weight, 2)
+            reasons.append(f"volume_ratio={volume_spike_ratio:.2f}x")
+
+    return vwap_penalty, volume_penalty, reasons
 
 def _planned_stop_loss(signal: str, premium_price: float, suggested_stop: float, candles, regime_snapshot: MarketRegimeSnapshot) -> float:
     settings = _execution_settings()
-    if settings.stop_loss_mode == "CANDLE" and candles:
-        reference = candles[-1]
-        candle_sl = float(reference.low) if signal == "BUY_CE" else float(reference.high)
-        return min(candle_sl, premium_price) if signal == "BUY_CE" else max(candle_sl, premium_price)
+    base_stop = suggested_stop if 0 < suggested_stop < premium_price else premium_price * (1 - settings.stop_loss_percent)
 
-    atr = regime_snapshot.atr
-    if atr is not None:
-        atr_distance = atr * settings.atr_stop_multiplier
-        atr_stop = premium_price - atr_distance
-        return max(atr_stop, 0.05)
-    return suggested_stop
+    normalized_distance_pct = None
+    if candles:
+        last_spot = max(float(candles[-1].close), 0.01)
+        if settings.stop_loss_mode == "CANDLE":
+            reference = candles[-1]
+            if signal == "BUY_CE":
+                normalized_distance_pct = (last_spot - float(reference.low)) / last_spot
+            else:
+                normalized_distance_pct = (float(reference.high) - last_spot) / last_spot
+        elif regime_snapshot.atr is not None:
+            normalized_distance_pct = float(regime_snapshot.atr) / last_spot
 
+    if normalized_distance_pct is not None:
+        distance_pct = min(
+            max(normalized_distance_pct * settings.atr_stop_multiplier, settings.min_stop_loss_pct),
+            settings.max_stop_loss_pct,
+        )
+        dynamic_stop = premium_price * (1 - distance_pct)
+        return round(max(dynamic_stop, 0.05), 2)
+
+    fallback_stop = premium_price * (1 - min(max(settings.stop_loss_percent, settings.min_stop_loss_pct), settings.max_stop_loss_pct))
+    return round(max(min(base_stop, premium_price - 0.05), fallback_stop, 0.05), 2)
 
 def _entry_confirmation_passed(active_trade: ActiveTrade, candle_manager: CandleManager) -> bool:
     last_candle = candle_manager.get_last_completed_candle(active_trade.symbol)
@@ -970,7 +1240,8 @@ def _handle_partial_profit(symbol: str, active_trade: ActiveTrade, current_price
     if rr_now < _execution_settings().partial_profit_rr:
         return active_trade
 
-    partial_quantity = max((active_trade.remaining_quantity // 2), 1)
+    partial_qty_pct = min(max(_execution_settings().partial_profit_size_pct, 0.1), 0.9)
+    partial_quantity = max(int(active_trade.remaining_quantity * partial_qty_pct), 1)
     if order_manager.instrument is not None and order_manager.instrument.lot_size > 1:
         partial_quantity = max((partial_quantity // order_manager.instrument.lot_size), 1) * order_manager.instrument.lot_size
         if partial_quantity >= active_trade.remaining_quantity:
@@ -978,12 +1249,13 @@ def _handle_partial_profit(symbol: str, active_trade: ActiveTrade, current_price
     if partial_quantity <= 0:
         return active_trade
 
-    exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=partial_quantity)
+    exit_order = _safe_exit_position(active_trade, current_price, order_manager, quantity=partial_quantity, reason="partial_profit")
     if exit_order is None:
         return active_trade
     exit_price = _extract_order_price(exit_order, current_price)
     remaining_quantity = max(active_trade.remaining_quantity - partial_quantity, 0)
     new_stop_order_id = active_trade.stop_loss_order_id
+    breakeven_stop = max(active_trade.stop_loss, active_trade.entry_price)
     if remaining_quantity > 0:
         try:
             new_stop_order_id = order_manager.replace_stop_loss_order(
@@ -991,7 +1263,7 @@ def _handle_partial_profit(symbol: str, active_trade: ActiveTrade, current_price
                 exchange=active_trade.exchange,
                 quantity=remaining_quantity,
                 current_order_id=active_trade.stop_loss_order_id,
-                stop_loss_price=max(active_trade.stop_loss, active_trade.entry_price),
+                stop_loss_price=breakeven_stop,
             )
         except Exception as exc:
             logging.exception("Failed to replace stop-loss order after partial exit for %s", active_trade.trading_symbol)
@@ -1005,6 +1277,7 @@ def _handle_partial_profit(symbol: str, active_trade: ActiveTrade, current_price
         quantity=partial_quantity,
         price=exit_price,
         status="PARTIAL_EXIT",
+        reason="partial_profit",
     )
     realized_pnl = (exit_price - (active_trade.entry_price or exit_price)) * partial_quantity
     DAILY_STATE["daily_pnl"] = float(DAILY_STATE["daily_pnl"]) + realized_pnl
@@ -1013,27 +1286,37 @@ def _handle_partial_profit(symbol: str, active_trade: ActiveTrade, current_price
         symbol=symbol,
         remaining_quantity=remaining_quantity,
         partial_exit_done=True,
-        stop_loss=max(active_trade.stop_loss, active_trade.entry_price),
+        stop_loss=breakeven_stop,
         stop_loss_order_id=new_stop_order_id,
+        realized_pnl=float(active_trade.realized_pnl) + realized_pnl,
     )
     if updated_trade is not None:
         _print_partial_exit(updated_trade, exit_price, partial_quantity)
     return updated_trade
 
-
 def _should_time_exit(active_trade: ActiveTrade, current_price: float) -> bool:
     if active_trade.opened_at is None or active_trade.entry_price is None:
         return False
     settings = _execution_settings()
+    now = datetime.now()
     try:
         opened_at = datetime.fromisoformat(active_trade.opened_at)
     except ValueError:
         return False
-    if datetime.now() < opened_at + timedelta(minutes=settings.time_exit_minutes):
+    close_time = _market_close_time()
+    if now >= close_time - timedelta(minutes=settings.hard_flatten_minutes_before_close):
+        return True
+    if now < opened_at + timedelta(minutes=settings.time_exit_minutes):
         return False
     movement_pct = abs(current_price - active_trade.entry_price) / max(active_trade.entry_price, 0.01)
     return movement_pct <= settings.no_movement_threshold_pct
 
+
+def _market_close_time() -> datetime:
+    now = datetime.now()
+    market_type = os.getenv("MARKET_TYPE", "EQUITY").strip().upper()
+    close_hour, close_minute = (23, 30) if market_type == "MCX" else (15, 30)
+    return now.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
 
 def _calculate_rr(entry_price: float, stop_loss: float, target_price: float) -> float:
     risk = max(entry_price - stop_loss, 0.01)

@@ -185,8 +185,25 @@ class MarketDataService:
         self._heartbeat_started = True
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
+    # IMPROVED: heartbeat now surfaces stale feed / stale candle conditions.
     def _heartbeat_loop(self) -> None:
         while True:
+            now = datetime.now()
+            if self._last_tick_at is not None:
+                tick_gap = (now - self._last_tick_at).total_seconds()
+                if tick_gap >= self.settings.stale_tick_warning_seconds:
+                    logger.warning(
+                        "# EXECUTION FIX stale market feed detected | no ticks for %.0fs | profile=%s",
+                        tick_gap,
+                        self.settings.execution_profile,
+                    )
+            if self._last_closed_candle_at is not None:
+                candle_gap = (now - self._last_closed_candle_at).total_seconds()
+                if candle_gap >= self.settings.stale_candle_warning_seconds:
+                    logger.warning(
+                        "# EXECUTION FIX stale candle stream detected | no closed candle for %.0fs",
+                        candle_gap,
+                    )
             time.sleep(30)
 
     def _start_countdown(self) -> None:

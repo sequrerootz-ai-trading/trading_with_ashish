@@ -41,6 +41,7 @@ class OptionSuggestion:
     label: str
     premium_ltp: float | None = None
     trading_symbol: str | None = None
+    expiry: str | None = None
     entry_low: float | None = None
     entry_high: float | None = None
     stop_loss: float | None = None
@@ -67,3 +68,7 @@ class GeneratedSignal:
     reason: str
     confidence: float
     details: SignalDetails | None = None
+    entry_price: float | None = None
+    target: float | None = None
+    stop_loss: float | None = None
+    context: dict[str, object] = field(default_factory=dict)

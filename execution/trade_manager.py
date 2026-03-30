@@ -17,6 +17,8 @@ class TradeRecord:
     quantity: int
     price: float
     status: str
+    reason: str
+    order_id: str | None
     created_at: str
 
 
@@ -42,40 +44,31 @@ class ActiveTrade:
     regime: str
     entry_reason: str
     rr_ratio: float
+    target_price: float | None
     confirmation_high: float | None
     confirmation_low: float | None
     opened_at: str | None
+    realized_pnl: float
+    mfe_price: float | None
+    mae_price: float | None
+    exit_reason: str | None
     status: str
     created_at: str
 
 
 class TradeManager:
+    # NEW: tracks richer lifecycle state without altering signal logic.
     def __init__(self) -> None:
         self._trade_log: list[TradeRecord] = []
         self._active_trades: dict[str, ActiveTrade] = {}
 
-        # NEW (safe): optional mapping for future scalability
+        # NEW: optional mapping for future scalability.
         self._trade_ids: dict[str, str] = {}
-
-    # -------------------------------------------
-    # INTERNAL HELPERS (SAFE ADDITIONS)
-    # -------------------------------------------
 
     def _generate_trade_id(self) -> str:
         return str(uuid.uuid4())
 
-    def _calculate_pnl(self, side: str, entry: float, exit: float, qty: int) -> float:
-        """Supports BUY and SELL without breaking existing logic."""
-        try:
-            if side.upper() == "BUY":
-                return (exit - entry) * qty
-            elif side.upper() == "SELL":
-                return (entry - exit) * qty
-        except Exception as e:
-            logger.error("[PNL] Error calculating pnl: %s", e)
-        return 0.0
-
-    def _safe_float(self, value, default: float) -> float:
+    def _safe_float(self, value, default: float | None) -> float | None:
         try:
             return float(value)
         except Exception:
@@ -87,10 +80,6 @@ class TradeManager:
         except Exception:
             return default
 
-    # -------------------------------------------
-    # EXISTING METHODS (UNCHANGED BEHAVIOR)
-    # -------------------------------------------
-
     def record_trade(
         self,
         mode: str,
@@ -99,6 +88,8 @@ class TradeManager:
         quantity: int,
         price: float,
         status: str,
+        reason: str = "",
+        order_id: str | None = None,
     ) -> TradeRecord:
         record = TradeRecord(
             mode=mode,
@@ -107,13 +98,22 @@ class TradeManager:
             quantity=quantity,
             price=price,
             status=status,
+            reason=reason,
+            order_id=order_id,
             created_at=datetime.now(UTC).isoformat(),
         )
         self._trade_log.append(record)
 
         logger.info(
-            "[%s] %s %s @ %.2f qty=%s status=%s",
-            mode, side, symbol, price, quantity, status
+            "[%s] %s %s @ %.2f qty=%s status=%s reason=%s order_id=%s",
+            mode,
+            side,
+            symbol,
+            price,
+            quantity,
+            status,
+            reason or "-",
+            order_id or "-",
         )
 
         return record
@@ -132,10 +132,10 @@ class TradeManager:
         regime: str = "UNKNOWN",
         entry_reason: str = "",
         rr_ratio: float = 1.0,
+        target_price: float | None = None,
         confirmation_high: float | None = None,
         confirmation_low: float | None = None,
     ) -> ActiveTrade:
-
         trade = ActiveTrade(
             symbol=symbol,
             signal=signal,
@@ -157,9 +157,14 @@ class TradeManager:
             regime=regime,
             entry_reason=entry_reason,
             rr_ratio=rr_ratio,
+            target_price=target_price,
             confirmation_high=confirmation_high,
             confirmation_low=confirmation_low,
             opened_at=None,
+            realized_pnl=0.0,
+            mfe_price=entry_price,
+            mae_price=entry_price,
+            exit_reason=None,
             status="PENDING_ENTRY",
             created_at=datetime.now(UTC).isoformat(),
         )
@@ -197,10 +202,13 @@ class TradeManager:
             trading_symbol=str(changes.get("trading_symbol", trade.trading_symbol)),
             exchange=str(changes.get("exchange", trade.exchange)),
             option_type=str(changes.get("option_type", trade.option_type)),
-            entry_low=self._safe_float(changes.get("entry_low", trade.entry_low), trade.entry_low),
-            entry_high=self._safe_float(changes.get("entry_high", trade.entry_high), trade.entry_high),
-            stop_loss=self._safe_float(changes.get("stop_loss", trade.stop_loss), trade.stop_loss),
-            initial_stop_loss=self._safe_float(changes.get("initial_stop_loss", trade.initial_stop_loss), trade.initial_stop_loss),
+            entry_low=float(self._safe_float(changes.get("entry_low", trade.entry_low), trade.entry_low) or trade.entry_low),
+            entry_high=float(self._safe_float(changes.get("entry_high", trade.entry_high), trade.entry_high) or trade.entry_high),
+            stop_loss=float(self._safe_float(changes.get("stop_loss", trade.stop_loss), trade.stop_loss) or trade.stop_loss),
+            initial_stop_loss=float(
+                self._safe_float(changes.get("initial_stop_loss", trade.initial_stop_loss), trade.initial_stop_loss)
+                or trade.initial_stop_loss
+            ),
             quantity=self._safe_int(changes.get("quantity", trade.quantity), trade.quantity),
             remaining_quantity=self._safe_int(changes.get("remaining_quantity", trade.remaining_quantity), trade.remaining_quantity),
             entry_price=(
@@ -227,7 +235,12 @@ class TradeManager:
             partial_exit_done=bool(changes.get("partial_exit_done", trade.partial_exit_done)),
             regime=str(changes.get("regime", trade.regime)),
             entry_reason=str(changes.get("entry_reason", trade.entry_reason)),
-            rr_ratio=self._safe_float(changes.get("rr_ratio", trade.rr_ratio), trade.rr_ratio),
+            rr_ratio=float(self._safe_float(changes.get("rr_ratio", trade.rr_ratio), trade.rr_ratio) or trade.rr_ratio),
+            target_price=(
+                self._safe_float(changes["target_price"], trade.target_price)
+                if "target_price" in changes and changes["target_price"] is not None
+                else trade.target_price
+            ),
             confirmation_high=(
                 self._safe_float(changes["confirmation_high"], trade.confirmation_high)
                 if "confirmation_high" in changes and changes["confirmation_high"] is not None
@@ -243,12 +256,41 @@ class TradeManager:
                 if "opened_at" in changes and changes["opened_at"] is not None
                 else trade.opened_at
             ),
+            realized_pnl=float(self._safe_float(changes.get("realized_pnl", trade.realized_pnl), trade.realized_pnl) or 0.0),
+            mfe_price=(
+                self._safe_float(changes["mfe_price"], trade.mfe_price)
+                if "mfe_price" in changes and changes["mfe_price"] is not None
+                else trade.mfe_price
+            ),
+            mae_price=(
+                self._safe_float(changes["mae_price"], trade.mae_price)
+                if "mae_price" in changes and changes["mae_price"] is not None
+                else trade.mae_price
+            ),
+            exit_reason=(
+                str(changes["exit_reason"])
+                if "exit_reason" in changes and changes["exit_reason"] is not None
+                else trade.exit_reason
+            ),
             status=str(changes.get("status", trade.status)),
             created_at=trade.created_at,
         )
 
         self._active_trades[symbol] = updated
         return updated
+
+    # NEW: helper for closed-trade snapshots without mutating active state.
+    def update_trade_snapshot(self, trade: ActiveTrade, **changes) -> ActiveTrade:
+        previous_trade = self._active_trades.get(trade.symbol)
+        self._active_trades[trade.symbol] = trade
+        try:
+            updated = self.update_active_trade(trade.symbol, **changes)
+        finally:
+            if previous_trade is None:
+                self._active_trades.pop(trade.symbol, None)
+            else:
+                self._active_trades[trade.symbol] = previous_trade
+        return updated or trade
 
     def close_active_trade(self, symbol: str, reason: str, exit_price: float) -> ActiveTrade | None:
         trade = self._active_trades.pop(symbol, None)
@@ -257,15 +299,21 @@ class TradeManager:
         if trade is None:
             return None
 
+        closed_trade = self.update_trade_snapshot(
+            trade,
+            status="CLOSED",
+            exit_reason=reason,
+        )
+
         logger.info(
             "[PLAN] Closed trade plan for %s | %s | exit=%.2f | reason=%s",
             symbol,
-            trade.trading_symbol,
+            closed_trade.trading_symbol,
             exit_price,
             reason,
         )
 
-        return trade
+        return closed_trade
 
     def get_trade_log(self) -> list[TradeRecord]:
         return list(self._trade_log)

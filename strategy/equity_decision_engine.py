@@ -109,6 +109,17 @@ def build_equity_decision(symbol: str, data: SignalContext) -> GeneratedSignal:
         )
 
     option_suggestion = select_option_strike(symbol, current_candle.close, str(validation["direction"]))
+    premium_levels = calculate_premium_trade_levels(
+        option_suggestion.premium_ltp if option_suggestion.premium_ltp is not None else current_candle.close,
+        confidence_pct=confidence_pct,
+    )
+    option_suggestion = replace(
+        option_suggestion,
+        entry_low=premium_levels["entry_price"],
+        entry_high=premium_levels["entry_price"],
+        stop_loss=premium_levels["stop_loss"],
+        target=premium_levels["target"],
+    )
     confidence_label = _confidence_label(confidence_pct)
     risk_label = "Risky Entry" if bool(validation["is_risky"]) else "Normal Entry"
     details = SignalDetails(
@@ -128,6 +139,9 @@ def build_equity_decision(symbol: str, data: SignalContext) -> GeneratedSignal:
         reason=str(validation["reason"]),
         confidence=confidence_pct / 100.0,
         details=details,
+        entry_price=premium_levels["entry_price"],
+        target=premium_levels["target"],
+        stop_loss=premium_levels["stop_loss"],
     )
 
 
@@ -297,6 +311,27 @@ def calculate_entry_exit(option_ltp: float, confidence_pct: int) -> dict[str, fl
     return calculate_trade_levels(option_ltp, strength=strength)
 
 
+def calculate_premium_trade_levels(entry_price: float, confidence_pct: int) -> dict[str, float]:
+    if entry_price <= 0:
+        raise ValueError("entry_price must be greater than 0")
+
+    if confidence_pct >= 80:
+        target_multiplier = 1.20
+        stop_loss_multiplier = 0.95
+    elif confidence_pct >= 65:
+        target_multiplier = 1.15
+        stop_loss_multiplier = 0.93
+    else:
+        target_multiplier = 1.10
+        stop_loss_multiplier = 0.90
+
+    return {
+        "entry_price": round(entry_price, 2),
+        "target": round(entry_price * target_multiplier, 2),
+        "stop_loss": round(entry_price * stop_loss_multiplier, 2),
+    }
+
+
 def calculate_trade_levels(ltp: float, strength: str = "moderate") -> dict[str, float]:
     if ltp <= 0:
         raise ValueError("ltp must be greater than 0")
@@ -331,9 +366,9 @@ def enrich_signal_with_premium(signal: GeneratedSignal, premium: PremiumQuote | 
     if signal.details is None or signal.details.option_suggestion is None or premium is None:
         return signal
 
-    levels = calculate_trade_levels(
+    premium_levels = calculate_premium_trade_levels(
         premium.last_price,
-        strength=_trade_strength_from_confidence(signal.details.confidence_pct),
+        confidence_pct=signal.details.confidence_pct,
     )
     option_label = signal.details.option_suggestion.label
     if premium.strike is not None and premium.option_type is not None:
@@ -345,13 +380,20 @@ def enrich_signal_with_premium(signal: GeneratedSignal, premium: PremiumQuote | 
         label=option_label,
         premium_ltp=round(premium.last_price, 2),
         trading_symbol=premium.trading_symbol,
-        entry_low=levels["entry_low"],
-        entry_high=levels["entry_high"],
-        stop_loss=levels["stop_loss"],
-        target=levels["target"],
+        expiry=premium.expiry.isoformat() if premium.expiry is not None else None,
+        entry_low=premium_levels["entry_price"],
+        entry_high=premium_levels["entry_price"],
+        stop_loss=premium_levels["stop_loss"],
+        target=premium_levels["target"],
     )
     details = replace(signal.details, option_suggestion=option)
-    return replace(signal, details=details)
+    return replace(
+        signal,
+        details=details,
+        entry_price=premium_levels["entry_price"],
+        target=premium_levels["target"],
+        stop_loss=premium_levels["stop_loss"],
+    )
 
 
 def format_output(signal: GeneratedSignal) -> str:

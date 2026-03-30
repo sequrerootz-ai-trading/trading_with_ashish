@@ -28,6 +28,7 @@ class ManagedOrder:
 
 
 class OrderManager:
+    # IMPROVED: execution now logs reasons and protects high-slippage fills.
     def __init__(
         self,
         kite: KiteConnect | None,
@@ -143,7 +144,15 @@ class OrderManager:
         entry_status = self.wait_for_order_completion(entry_order_id)
         entry_price = self._extract_average_price(entry_status, fallback_price=last_price)
         slippage = abs(entry_price - last_price)
-        logger.info("Slippage for %s: %.2f", trading_symbol, slippage)
+        slippage_pct = slippage / max(last_price, 0.01)
+        logger.info("Slippage for %s: %.2f (%.2f%%)", trading_symbol, slippage, slippage_pct * 100)
+        if slippage_pct > self.settings.max_entry_slippage_pct:
+            logger.warning(
+                "# IMPROVED high slippage fill kept protected for %s | actual=%.2f%% max=%.2f%%",
+                trading_symbol,
+                slippage_pct * 100,
+                self.settings.max_entry_slippage_pct * 100,
+            )
 
         live_stop_loss_price = self._round_to_tick(
             stop_loss_price if stop_loss_price is not None else self._calculate_stop_loss_price(entry_price)
@@ -163,6 +172,8 @@ class OrderManager:
             quantity=quantity,
             price=entry_price,
             status="COMPLETE",
+            reason="entry_filled",
+            order_id=entry_order_id,
         )
         self._update_position(trading_symbol, quantity, entry_price, "BUY")
         logger.info("[LIVE] Order placed %s @ %.2f", trading_symbol, entry_price)
@@ -339,6 +350,8 @@ class OrderManager:
             quantity=quantity,
             price=last_price,
             status="SIMULATED",
+            reason="entry_simulated",
+            order_id=entry_order_id,
         )
         self._update_position(trading_symbol, quantity, last_price, "BUY")
         logger.info("[PAPER] Simulated BUY %s @ %.2f", trading_symbol, last_price)
@@ -361,6 +374,7 @@ class OrderManager:
         quantity: int,
         last_price: float,
         product: str | None = None,
+        reason: str = "manual_exit",
     ) -> dict[str, Any]:
         product_to_use = (product or self.settings.default_product).upper()
 
@@ -385,6 +399,8 @@ class OrderManager:
                 quantity=quantity,
                 price=last_price,
                 status="SIMULATED_EXIT",
+                reason=reason,
+                order_id=order_id,
             )
             return dict(self._paper_orders[order_id])
 
@@ -412,6 +428,8 @@ class OrderManager:
             quantity=quantity,
             price=exit_price,
             status="COMPLETE",
+            reason=reason,
+            order_id=order_id,
         )
         return order
 

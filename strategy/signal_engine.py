@@ -8,6 +8,8 @@ from config import get_market_type
 from data.candle_store import Candle
 from data.database import TradingDatabase
 from strategy.market_regime import detect_market_regime
+from strategy.mcx_option_helper import enrich_mcx_signal_with_option
+from strategy.nifty_hybrid import generate_nifty_hybrid_signal
 from strategy.signal_types import GeneratedSignal, SignalContext
 from strategy.strategy_equity import generate_equity_signal
 from strategy.strategy_mcx import generate_mcx_signal
@@ -76,12 +78,17 @@ def _check_trade_cooldown(symbol: str, cooldown_minutes: int = 5) -> tuple[bool,
     return True, "cooldown_ok"
 
 
+# ✅ UPDATED: Removed daily trade limit restriction
 def _check_daily_trade_limit(symbol: str, max_trades: int = 5) -> tuple[bool, str]:
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     count = _daily_trade_counts[symbol][today]
-    if count >= max_trades:
-        logger.info("[DAILY_LIMIT] %s - max %d trades reached (count=%d)", symbol, max_trades, count)
-        return False, f"daily_limit_reached_{count}"
+
+    # ❌ OLD LOGIC (REMOVED)
+    # if count >= max_trades:
+    #     logger.info("[DAILY_LIMIT] %s - max %d trades reached (count=%d)", symbol, max_trades, count)
+    #     return False, f"daily_limit_reached_{count}"
+
+    # ✅ NEW: Always allow trades
     return True, f"trades_today_{count}"
 
 
@@ -146,8 +153,17 @@ def generate_signal(
             confidence=0.0,
         )
 
+    normalized_symbol = symbol.strip().upper()
     if normalized_market_type == "MCX":
         signal = generate_mcx_signal(symbol, data)
+        signal = enrich_mcx_signal_with_option(
+            symbol=symbol,
+            generated_signal=signal,
+            spot_price=float(data.last_candle.close) if data.last_candle is not None else 0.0,
+            option_chain=(sentiment or {}).get("option_chain"),
+        )
+    elif normalized_market_type == "EQUITY" and normalized_symbol == "NIFTY":
+        signal = generate_nifty_hybrid_signal(data)
     else:
         signal = generate_equity_signal(symbol, data, sentiment or _default_sentiment())
 
@@ -178,10 +194,17 @@ def generate_signal(
     if _is_valid_signal(signal):
         _record_signal_fired(symbol)
 
+    option_label, expiry_label = _signal_option_context(signal)
     logger.info(
-        "[SIGNAL_ENGINE] %s | Signal=%s | Confidence=%.2f | Regime=%s",
-        symbol, signal.signal, signal.confidence, regime_reason,
+        "[SIGNAL_ENGINE] %s | Signal=%s | Confidence=%.2f | Regime=%s%s%s",
+        symbol,
+        signal.signal,
+        signal.confidence,
+        regime_reason,
+        f" | Option={option_label}" if option_label else "",
+        f" | Expiry={expiry_label}" if expiry_label else "",
     )
+    _log_option_decision(symbol, signal)
     return signal
 
 
@@ -207,3 +230,41 @@ def _default_sentiment() -> dict[str, object]:
         "confidence": 0.0,
         "reason": "sentiment_disabled",
     }
+
+def _signal_option_context(signal: GeneratedSignal) -> tuple[str | None, str | None]:
+    details = getattr(signal, "details", None)
+    option = getattr(details, "option_suggestion", None)
+    if option is None:
+        return None, None
+
+    option_label = None
+    strike = getattr(option, "strike", None)
+    option_type = getattr(option, "option_type", None)
+    trading_symbol = getattr(option, "trading_symbol", None)
+    label = getattr(option, "label", None)
+    if strike is not None and option_type:
+        option_label = f"{strike} {option_type}"
+    elif trading_symbol:
+        option_label = str(trading_symbol)
+    elif label:
+        option_label = str(label)
+
+    expiry = getattr(option, "expiry", None)
+    return option_label, (str(expiry) if expiry else None)
+
+
+def _log_option_decision(symbol: str, signal: GeneratedSignal) -> None:
+    option_label, expiry_label = _signal_option_context(signal)
+    if option_label is None:
+        return
+
+    reason = signal.reason or "unspecified"
+    verdict = "Accepted" if signal.signal not in {"NO_TRADE", "", None} else "Rejected"
+    logger.info(
+        "[OPTION_DECISION] %s %s%s | %s | Reason=%s",
+        symbol,
+        option_label,
+        f" | Expiry={expiry_label}" if expiry_label else "",
+        verdict,
+        reason,
+    )
