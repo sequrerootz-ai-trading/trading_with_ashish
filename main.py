@@ -11,11 +11,13 @@ from data.candle_manager import CandleManager
 from data.data_loader import HistoricalDataLoader, MINIMUM_STARTUP_CANDLES
 from data.database import TradingDatabase
 from data.market_data import MarketDataService
+from data.mcx_option_chain import McxOptionChainService
 from data.option_premium import OptionPremiumService
 from execution.order_manager import OrderManager
 from execution.trade_manager import ActiveTrade, TradeManager
 from strategy.equity_decision_engine import enrich_signal_with_premium
 from strategy.indicators import calculate_ema
+from strategy.mcx_option_helper import enrich_mcx_signal_with_option
 from strategy.market_regime import MarketRegimeSnapshot, detect_market_regime
 from strategy.signal_engine import store_market_data, store_signal
 from strategy.strategy import LastClosedCandleStrategy, MINIMUM_INDICATOR_CANDLES
@@ -66,6 +68,7 @@ def main() -> None:
     candle_manager = CandleManager(max_candles=100)
     loader = HistoricalDataLoader(market_data, database)
     premium_service = OptionPremiumService(market_data.clients.kite, market_type=market_type)
+    mcx_option_chain_service = McxOptionChainService(market_data.clients.kite)
     trade_manager = TradeManager()
     order_manager = OrderManager(
         market_data.clients.kite,
@@ -115,7 +118,7 @@ def main() -> None:
                 last_completed.end.strftime("%Y-%m-%d %H:%M"),
                 generated_signal.signal,
             )
-        _handle_generated_signal(symbol, generated_signal, premium_service, last_completed.close if last_completed else 0.0, trade_manager, order_manager, candle_manager)
+        _handle_generated_signal(symbol, generated_signal, premium_service, mcx_option_chain_service, last_completed.close if last_completed else 0.0, trade_manager, order_manager, candle_manager)
 
     def handle_closed_candle(candle) -> None:
         candle_manager.on_new_closed_candle(candle)
@@ -147,7 +150,7 @@ def main() -> None:
         except Exception as exc:
             logging.warning("Failed to store signal in DB: %s", exc)
 
-        _handle_generated_signal(symbol, generated, premium_service, candle.close, trade_manager, order_manager, candle_manager)
+        _handle_generated_signal(symbol, generated, premium_service, mcx_option_chain_service, candle.close, trade_manager, order_manager, candle_manager)
 
     market_data.on_candle = handle_closed_candle
 
@@ -168,7 +171,7 @@ def main() -> None:
     market_data.start()
 
 
-def _handle_generated_signal(symbol: str, generated_signal, premium_service, spot_price: float, trade_manager: TradeManager, order_manager: OrderManager, candle_manager: CandleManager) -> None:
+def _handle_generated_signal(symbol: str, generated_signal, premium_service, mcx_option_chain_service: McxOptionChainService, spot_price: float, trade_manager: TradeManager, order_manager: OrderManager, candle_manager: CandleManager) -> None:
     _reset_daily_state_if_needed()
     settings = _execution_settings()
     if trade_manager.has_active_trade(symbol):
@@ -189,7 +192,7 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, spo
     if _max_trades_reached():
         _print_blocked("Max trades reached")
         return
-    if _cooldown_active():
+    if _mode_label() != "PAPER" and _cooldown_active():
         DAILY_STATE["cooldown_candles"] = max(int(DAILY_STATE["cooldown_candles"]) - 1, 0)
         _print_skip("Trade cooldown active")
         return
@@ -223,7 +226,18 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, spo
         _register_trade_plan(symbol, enriched_signal, premium, trade_manager, candle_manager, regime_snapshot)
         _print_signal(enriched_signal)
     elif generated_signal.signal in {"BUY", "SELL"}:
-        _print_signal(generated_signal)
+        option_chain = mcx_option_chain_service.get_option_chain(symbol, spot_price)
+        enriched_signal = enrich_mcx_signal_with_option(symbol, generated_signal, spot_price, option_chain)
+        option = enriched_signal.details.option_suggestion if enriched_signal.details is not None else None
+        premium_price = option.premium_ltp if option is not None and option.premium_ltp is not None else None
+        if premium_price is not None and _should_skip_trade(symbol, enriched_signal, premium_price, candle_manager, regime_snapshot):
+            return
+        if option is not None:
+            planned_trade = _register_mcx_trade_plan(symbol, enriched_signal, trade_manager, candle_manager, regime_snapshot)
+            if planned_trade is None:
+                logging.info("Skipping MCX trade plan print for %s because plan registration did not succeed.", symbol)
+                return
+        _print_signal(enriched_signal)
     else:
         _log_no_trade(symbol, generated_signal.reason)
 
@@ -286,6 +300,52 @@ def _register_trade_plan(
         entry_reason=generated_signal.reason,
         rr_ratio=rr_ratio,
         target_price=signal_target_price,
+        confirmation_high=(last_candle.high if last_candle is not None else None),
+        confirmation_low=(last_candle.low if last_candle is not None else None),
+    )
+
+
+def _register_mcx_trade_plan(
+    symbol: str,
+    generated_signal,
+    trade_manager: TradeManager,
+    candle_manager: CandleManager,
+    regime_snapshot: MarketRegimeSnapshot,
+) -> ActiveTrade | None:
+    if generated_signal.details is None or generated_signal.details.option_suggestion is None:
+        return None
+    option = generated_signal.details.option_suggestion
+    if (
+        option.entry_low is None
+        or option.entry_high is None
+        or option.stop_loss is None
+        or option.target is None
+        or not option.trading_symbol
+    ):
+        return None
+    if trade_manager.has_active_trade(symbol):
+        logging.info("Skipping MCX signal for %s because one active trade already exists.", symbol)
+        return None
+
+    entry_price = generated_signal.entry_price if generated_signal.entry_price is not None else option.entry_high
+    stop_loss = generated_signal.stop_loss if generated_signal.stop_loss is not None else option.stop_loss
+    target_price = generated_signal.target if generated_signal.target is not None else option.target
+    rr_ratio = _calculate_rr(entry_price, stop_loss, target_price)
+    last_candle = candle_manager.get_last_completed_candle(symbol)
+    return trade_manager.open_trade_plan(
+        symbol=symbol,
+        signal=generated_signal.signal,
+        trading_symbol=option.trading_symbol,
+        exchange=option.exchange or "MCX",
+        option_type=option.option_type,
+        entry_low=option.entry_low,
+        entry_high=option.entry_high,
+        stop_loss=stop_loss,
+        entry_price=None,
+        regime=regime_snapshot.regime,
+        entry_reason=generated_signal.reason,
+        rr_ratio=rr_ratio,
+        target_price=target_price,
         confirmation_high=(last_candle.high if last_candle is not None else None),
         confirmation_low=(last_candle.low if last_candle is not None else None),
     )
@@ -607,18 +667,22 @@ def _print_signal(generated_signal) -> None:
     if generated_signal.details is not None and generated_signal.details.option_suggestion is not None:
         option = generated_signal.details.option_suggestion
         lines = [
-            f"[{_mode_label()} SIGNAL] {generated_signal.symbol} | {_friendly_signal(generated_signal.signal)}",
-            f"Confidence: {_format_confidence(generated_signal.confidence)}",
-            f"Why: {generated_signal.details.summary}",
+            f"[{_mode_label()} SIGNAL] {generated_signal.symbol} | {_friendly_signal(generated_signal.signal)} | Confidence={_format_confidence(generated_signal.confidence)}",
+            "",
+            "[TRADE PLAN]",
+            f"Symbol: {generated_signal.symbol}",
+            f"Option: {option.label}",
         ]
-        if option.trading_symbol:
-            lines.append(f"Contract: {option.trading_symbol}")
+        if option.expiry:
+            lines.append(f"Expiry: {option.expiry}")
         if option.premium_ltp is not None:
-            lines.append(f"Premium LTP: {_fmt_rupee(option.premium_ltp)}")
-        if option.entry_low is not None and option.entry_high is not None:
-            lines.append(f"Entry Range: {_fmt_rupee(option.entry_low)} to {_fmt_rupee(option.entry_high)}")
+            lines.append(f"Entry: {_fmt_rupee(option.premium_ltp)}")
+        if option.target is not None:
+            lines.append(f"Target: {_fmt_rupee(option.target)}")
         if option.stop_loss is not None:
-            lines.append(f"Stop Loss: {_fmt_rupee(option.stop_loss)}")
+            lines.append(f"StopLoss: {_fmt_rupee(option.stop_loss)}")
+        if generated_signal.details.summary:
+            lines.append(f"Why: {generated_signal.details.summary}")
         print(colorize("\n".join(lines), color, bold=True))
         return
 
@@ -974,6 +1038,17 @@ def _higher_timeframe_penalty(symbol: str, signal: str, candle_manager: CandleMa
     if signal == "BUY_PE" and fast_ema >= slow_ema:
         return round(severity * settings.filter_higher_tf_weight, 2)
     return 0.0
+
+
+def _aggregate_higher_timeframe_closes(candles, multiple: int) -> list[float]:
+    if multiple <= 1:
+        return [float(candle.close) for candle in candles]
+
+    aggregated: list[float] = []
+    usable_count = len(candles) - (len(candles) % multiple)
+    for index in range(multiple - 1, usable_count, multiple):
+        aggregated.append(float(candles[index].close))
+    return aggregated
 
 
 def _regime_penalty(regime_snapshot: MarketRegimeSnapshot, settings) -> float:

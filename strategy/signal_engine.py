@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict
 from datetime import UTC, datetime
 
-from config import get_market_type
+from config import get_market_type, get_mode
 from data.candle_store import Candle
 from data.database import TradingDatabase
 from strategy.market_regime import detect_market_regime
@@ -144,7 +144,7 @@ def generate_signal(
         )
 
     cooldown_ok, cooldown_reason = _check_trade_cooldown(symbol, cooldown_minutes)
-    if not cooldown_ok:
+    if get_mode().upper() != "PAPER" and not cooldown_ok:
         return GeneratedSignal(
             symbol=symbol,
             timestamp=now_ts,

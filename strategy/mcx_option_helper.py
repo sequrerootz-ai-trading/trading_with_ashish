@@ -21,7 +21,7 @@ def select_mcx_option(symbol: str, signal: str, spot_price: float, option_chain:
 
     option_type = "CE" if normalized_signal == "BUY" else "PE"
     atm_strike = int(round(float(spot_price) / STRIKE_STEP) * STRIKE_STEP)
-    preferred_strikes = [atm_strike, atm_strike + STRIKE_STEP] if normalized_signal == "BUY" else [atm_strike, atm_strike - STRIKE_STEP]
+    preferred_strikes = [atm_strike] if normalized_signal == "BUY" else [atm_strike]
 
     normalized_options: list[dict[str, float | str]] = []
     for item in option_chain:
@@ -38,6 +38,9 @@ def select_mcx_option(symbol: str, signal: str, spot_price: float, option_chain:
                 "strike": strike,
                 "type": item_option_type,
                 "ltp": round(ltp, 2),
+                "exchange": str(item.get("exchange") or "MCX"),
+                "tradingsymbol": str(item.get("tradingsymbol") or f"{symbol} {strike} {item_option_type}"),
+                "expiry": item.get("expiry"),
             }
         )
 
@@ -71,13 +74,18 @@ def enrich_mcx_signal_with_option(
     stop_loss = round(entry_price * 0.85, 2)
     strike = int(selected_option["strike"])
     option_type = str(selected_option["type"])
+    exchange = str(selected_option.get("exchange") or "MCX")
+    trading_symbol = str(selected_option.get("tradingsymbol") or f"{symbol} {strike} {option_type}")
+    expiry = str(selected_option.get("expiry")) if selected_option.get("expiry") else None
 
     option_suggestion = OptionSuggestion(
         strike=strike,
         option_type=option_type,
         label=f"{strike} {option_type}",
         premium_ltp=entry_price,
-        trading_symbol=f"{symbol} {strike} {option_type}",
+        trading_symbol=trading_symbol,
+        exchange=exchange,
+        expiry=expiry,
         entry_low=entry_price,
         entry_high=entry_price,
         stop_loss=stop_loss,
@@ -94,10 +102,11 @@ def enrich_mcx_signal_with_option(
     )
 
     logger.info(
-        "[OPTION] %s | %s %s | Entry=%.2f | Target=%.2f | SL=%.2f",
+        "[OPTION] %s | %s %s | Expiry=%s | Entry=%.2f | Target=%.2f | SL=%.2f",
         symbol,
         strike,
         option_type,
+        expiry or "NA",
         entry_price,
         target,
         stop_loss,

@@ -25,70 +25,64 @@ def generate_mcx_signal(symbol: str, data: SignalContext) -> GeneratedSignal:
     fast_timeframe = data.timeframe_minutes <= 3
 
     # =========================
-    # 🔹 Breakout Levels
+    # 🔹 Breakout Levels (SOFTENED)
     # =========================
-    recent_window = data.candles[-4:-1] if fast_timeframe else data.candles[-6:-1]
+    recent_window = data.candles[-4:-1] if fast_timeframe else data.candles[-5:-1]
     breakout_level = max(c.high for c in recent_window)
     breakdown_level = min(c.low for c in recent_window)
 
     # =========================
-    # 🔹 Candle Strength
+    # 🔹 Candle Strength (RELAXED)
     # =========================
     candle_range = max(current_candle.high - current_candle.low, 0.0)
     close_position = (
         0.5 if candle_range == 0 else (current_candle.close - current_candle.low) / candle_range
     )
 
-    bullish_close_threshold = 0.50 if fast_timeframe else 0.58
-    bearish_close_threshold = 0.50 if fast_timeframe else 0.42
+    bullish_close_threshold = 0.48 if fast_timeframe else 0.55
+    bearish_close_threshold = 0.52 if fast_timeframe else 0.45
 
     # =========================
-    # 🔹 Breakout Detection
+    # 🔹 Breakout Detection (FLEXIBLE)
     # =========================
     bullish_break = (
-        current_candle.close >= breakout_level if fast_timeframe else current_candle.close > breakout_level
-    ) or (
-        fast_timeframe
-        and current_candle.high >= breakout_level
-        and close_position >= bullish_close_threshold
+        current_candle.high >= breakout_level
+        or current_candle.close >= breakout_level * 0.998
     )
 
     bearish_break = (
-        current_candle.close <= breakdown_level if fast_timeframe else current_candle.close < breakdown_level
-    ) or (
-        fast_timeframe
-        and current_candle.low <= breakdown_level
-        and close_position <= bearish_close_threshold
+        current_candle.low <= breakdown_level
+        or current_candle.close <= breakdown_level * 1.002
     )
 
     # =========================
-    # 🔹 BOOSTERS (Scoring)
+    # 🔹 BOOSTERS (VERY LIGHT)
     # =========================
 
-    # Volatility
+    # Volatility (optional)
     recent_ranges = [(c.high - c.low) for c in data.candles[-6:-1]]
     avg_range = (sum(recent_ranges) / len(recent_ranges)) if recent_ranges else 0.0
     current_range = current_candle.high - current_candle.low
-    volatility_ok = current_range >= avg_range * 0.9 if avg_range > 0 else True
+    volatility_ok = current_range >= avg_range * 0.8 if avg_range > 0 else True
 
-    # Momentum
+    # Momentum (very relaxed)
     momentum = abs(current_candle.close - previous_candle.close)
     prev_momentum = abs(previous_candle.close - prev_reference.close)
-    momentum_ok = momentum >= prev_momentum * 0.8
+    momentum_ok = momentum >= prev_momentum * 0.6
 
-    # Strong close
-    strong_close_buy = close_position > 0.55
-    strong_close_sell = close_position < 0.45
+    # Strong close (relaxed)
+    strong_close_buy = close_position > 0.50
+    strong_close_sell = close_position < 0.50
 
     # =========================
-    # 🔹 SIGNAL LOGIC (HYBRID)
+    # 🔹 SIGNAL LOGIC (SOFT MODE)
     # =========================
     signal = "NO_TRADE"
     confidence = 0.0
     reason: list[str] = []
 
     # =========================
-    # ✅ BUY
+    # ✅ BUY (SOFT)
     # =========================
     if (
         trend == "bullish"
@@ -104,19 +98,16 @@ def generate_mcx_signal(symbol: str, data: SignalContext) -> GeneratedSignal:
         if strong_close_buy:
             score += 1
 
-        if score >= 1:  # 🔥 KEY: allows high frequency
-            signal = "BUY"
+        # 🔥 SOFT ENTRY: allow even score 0
+        signal = "BUY"
 
-            confidence = 0.6 + (score * 0.1)
-            confidence = min(confidence, 0.85)
+        confidence = 0.55 + (score * 0.1)
+        confidence = min(confidence, 0.80)
 
-            reason.extend(["ema_trend_up", "commodity_breakout", f"score={score}"])
-
-            if fast_timeframe and current_candle.close < breakout_level:
-                reason.append("wick_breakout")
+        reason.extend(["ema_trend_up", "soft_breakout", f"score={score}"])
 
     # =========================
-    # ✅ SELL
+    # ✅ SELL (SOFT)
     # =========================
     elif (
         trend == "bearish"
@@ -132,19 +123,15 @@ def generate_mcx_signal(symbol: str, data: SignalContext) -> GeneratedSignal:
         if strong_close_sell:
             score += 1
 
-        if score >= 1:
-            signal = "SELL"
+        signal = "SELL"
 
-            confidence = 0.6 + (score * 0.1)
-            confidence = min(confidence, 0.85)
+        confidence = 0.55 + (score * 0.1)
+        confidence = min(confidence, 0.80)
 
-            reason.extend(["ema_trend_down", "commodity_breakdown", f"score={score}"])
-
-            if fast_timeframe and current_candle.close > breakdown_level:
-                reason.append("wick_breakdown")
+        reason.extend(["ema_trend_down", "soft_breakdown", f"score={score}"])
 
     else:
-        reason.append("commodity_filter_not_met")
+        reason.append("soft_filter_not_met")
 
     # =========================
     # 🔹 Debug Logs

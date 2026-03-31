@@ -41,6 +41,7 @@ class OptionSuggestion:
     label: str
     premium_ltp: float | None = None
     trading_symbol: str | None = None
+    exchange: str | None = None
     expiry: str | None = None
     entry_low: float | None = None
     entry_high: float | None = None

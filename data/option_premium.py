@@ -212,9 +212,46 @@ def _preferred_strikes_for_spot(spot_price: float, instrument_type: str, contrac
 
 
 def _option_name_matches(row: dict, symbol: str) -> bool:
-    tradingsymbol = str(row.get("tradingsymbol") or "").upper()
-    name = str(row.get("name") or "").upper()
-    return name == symbol or tradingsymbol.startswith(symbol)
+    aliases = _symbol_aliases(symbol)
+    candidates = [
+        str(row.get("tradingsymbol") or "").upper(),
+        str(row.get("name") or "").upper(),
+        str(row.get("underlying") or "").upper(),
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized_candidate = _normalize_symbol_key(candidate)
+        for alias in aliases:
+            normalized_alias = _normalize_symbol_key(alias)
+            if candidate == alias or candidate.startswith(alias):
+                return True
+            if normalized_candidate == normalized_alias or normalized_candidate.startswith(normalized_alias):
+                return True
+    return False
+
+
+def _symbol_aliases(symbol: str) -> set[str]:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return set()
+
+    aliases = {normalized}
+    for separator in ("-", ".", " "):
+        if separator in normalized:
+            aliases.add(normalized.split(separator)[0])
+
+    if normalized.endswith("EQ"):
+        aliases.add(normalized[:-2].rstrip("-. "))
+    if normalized.endswith("-EQ"):
+        aliases.add(normalized[:-3].rstrip("-. "))
+
+    return {alias for alias in aliases if alias}
+
+
+def _normalize_symbol_key(value: str) -> str:
+    return "".join(char for char in str(value or "").upper() if char.isalnum())
 
 
 def _normalized_option_strike(row: dict) -> float | None:
