@@ -16,12 +16,12 @@ from data.option_premium import OptionPremiumService
 from execution.order_manager import OrderManager
 from execution.trade_manager import ActiveTrade, TradeManager
 from strategy.equity_decision_engine import enrich_signal_with_premium
+from strategy.nifty_options import enrich_nifty_signal_with_premium
 from strategy.indicators import calculate_ema
 from strategy.mcx_option_helper import enrich_mcx_signal_with_option
 from strategy.market_regime import MarketRegimeSnapshot, detect_market_regime
 from strategy.signal_engine import store_market_data, store_signal
 from strategy.strategy import LastClosedCandleStrategy, MINIMUM_INDICATOR_CANDLES
-
 
 # NEW: daily runtime controls and risk throttles
 DAILY_STATE = {
@@ -210,7 +210,7 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, mcx
         if premium is None:
             _print_premium_unavailable(symbol, "CE")
             return
-        enriched_signal = enrich_signal_with_premium(generated_signal, premium)
+        enriched_signal = enrich_nifty_signal_with_premium(generated_signal, premium) if symbol.strip().upper() == "NIFTY" else enrich_signal_with_premium(generated_signal, premium)
         if _should_skip_trade(symbol, enriched_signal, premium.last_price, candle_manager, regime_snapshot):
             return
         _register_trade_plan(symbol, enriched_signal, premium, trade_manager, candle_manager, regime_snapshot)
@@ -220,7 +220,7 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, mcx
         if premium is None:
             _print_premium_unavailable(symbol, "PE")
             return
-        enriched_signal = enrich_signal_with_premium(generated_signal, premium)
+        enriched_signal = enrich_nifty_signal_with_premium(generated_signal, premium) if symbol.strip().upper() == "NIFTY" else enrich_signal_with_premium(generated_signal, premium)
         if _should_skip_trade(symbol, enriched_signal, premium.last_price, candle_manager, regime_snapshot):
             return
         _register_trade_plan(symbol, enriched_signal, premium, trade_manager, candle_manager, regime_snapshot)
@@ -1469,5 +1469,10 @@ def _env_int(name: str, default: int) -> int:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
 
 

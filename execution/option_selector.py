@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
 from datetime import date, timedelta
-import calendar
 
 
 STEP_SIZE_BY_INDEX = {
@@ -60,6 +60,19 @@ def get_current_weekly_expiry(index_name: str, reference_date: date | None = Non
     if normalized_index == "BANKNIFTY":
         return _last_weekday_of_month(current_date, 1)
     raise ValueError(f"Unsupported index: {index_name}")
+
+
+def _next_weekday(current_date: date, target_weekday: int) -> date:
+    days_ahead = (target_weekday - current_date.weekday()) % 7
+    return current_date + timedelta(days=days_ahead)
+
+
+def _last_weekday_of_month(current_date: date, target_weekday: int) -> date:
+    last_day = calendar.monthrange(current_date.year, current_date.month)[1]
+    candidate = date(current_date.year, current_date.month, last_day)
+    while candidate.weekday() != target_weekday:
+        candidate -= timedelta(days=1)
+    return candidate
 
 
 def build_option_trading_symbol(

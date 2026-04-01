@@ -9,7 +9,7 @@ from data.candle_store import Candle
 from data.database import TradingDatabase
 from strategy.market_regime import detect_market_regime
 from strategy.mcx_option_helper import enrich_mcx_signal_with_option
-from strategy.nifty_hybrid import generate_nifty_hybrid_signal
+from strategy.nifty_options import generate_nifty_options_signal
 from strategy.signal_types import GeneratedSignal, SignalContext
 from strategy.strategy_equity import generate_equity_signal
 from strategy.strategy_mcx import generate_mcx_signal
@@ -26,10 +26,10 @@ def _is_valid_signal(signal: GeneratedSignal) -> bool:
 
 def _get_confidence_threshold(data: SignalContext) -> float:
     if data.timeframe_minutes <= 3:
-        return 0.50
+        return 0.45   # was 0.50
     if data.timeframe_minutes <= 5:
-        return 0.55
-    return 0.60
+        return 0.50   # was 0.55
+    return 0.55       # was 0.60
 
 
 def _passes_confidence_filter(signal: GeneratedSignal, data: SignalContext) -> bool:
@@ -163,7 +163,7 @@ def generate_signal(
             option_chain=(sentiment or {}).get("option_chain"),
         )
     elif normalized_market_type == "EQUITY" and normalized_symbol == "NIFTY":
-        signal = generate_nifty_hybrid_signal(data)
+        signal = generate_nifty_options_signal(data)
     else:
         signal = generate_equity_signal(symbol, data, sentiment or _default_sentiment())
 
@@ -268,3 +268,4 @@ def _log_option_decision(symbol: str, signal: GeneratedSignal) -> None:
         verdict,
         reason,
     )
+
