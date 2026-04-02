@@ -57,13 +57,25 @@ class McxOptionChainService:
             strike = _normalized_option_strike(contract)
             if strike is None:
                 continue
+            ohlc = quote.get("ohlc") or {}
+            depth = quote.get("depth") or {}
+            best_bid = ((depth.get("buy") or [{}])[0] or {}).get("price")
+            best_ask = ((depth.get("sell") or [{}])[0] or {}).get("price")
             option_chain.append(
                 {
                     "strike": int(round(strike)),
                     "option_type": str(contract.get("instrument_type") or "").upper(),
                     "ltp": round(ltp, 2),
+                    "previous_ltp": ohlc.get("close"),
+                    "change": quote.get("net_change") or quote.get("change"),
                     "volume": float(quote.get("volume") or 0.0),
                     "oi": float(quote.get("oi") or 0.0),
+                    "oi_change": float(quote.get("oi_day_high") or 0.0) - float(quote.get("oi_day_low") or 0.0),
+                    "bid": best_bid,
+                    "ask": best_ask,
+                    "high": ohlc.get("high"),
+                    "low": ohlc.get("low"),
+                    "open": ohlc.get("open"),
                     "tradingsymbol": str(contract.get("tradingsymbol") or ""),
                     "exchange": str(contract.get("exchange") or MCX_EXCHANGE),
                     "expiry": contract.get("expiry").isoformat() if contract.get("expiry") is not None else None,

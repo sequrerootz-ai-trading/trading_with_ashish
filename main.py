@@ -60,7 +60,6 @@ def main() -> None:
     logging.info("Runtime MARKET_TYPE=%s", market_type)
     logging.info("Runtime EXECUTION_PROFILE=%s", settings.execution_profile)
     logging.info("[INFO] Processing SYMBOL: %s", symbol)
-    logging.info("[INFO] Sentiment and news integrations disabled for fast execution.")
 
     market_data = MarketDataService(settings=settings)
     database = TradingDatabase()
@@ -139,7 +138,8 @@ def main() -> None:
         except Exception as exc:
             logging.warning("DB failed for market data, using in-memory buffer only: %s", exc)
 
-        _manage_active_trade(symbol, trade_manager, premium_service, order_manager, candle_manager)
+        if _mode_label() != "PAPER":
+            _manage_active_trade(symbol, trade_manager, premium_service, order_manager, candle_manager)
 
         generated = strategy.evaluate(_default_sentiment())
         if generated is None:
@@ -174,7 +174,7 @@ def main() -> None:
 def _handle_generated_signal(symbol: str, generated_signal, premium_service, mcx_option_chain_service: McxOptionChainService, spot_price: float, trade_manager: TradeManager, order_manager: OrderManager, candle_manager: CandleManager) -> None:
     _reset_daily_state_if_needed()
     settings = _execution_settings()
-    if trade_manager.has_active_trade(symbol):
+    if generated_signal.signal not in {"BUY", "SELL"} and trade_manager.has_active_trade(symbol):
         print(colorize("[SKIPPED] Active trade already exists", YELLOW, bold=True))
         return
     if settings.kill_switch or DAILY_STATE["halted_for_day"]:
@@ -213,7 +213,8 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, mcx
         enriched_signal = enrich_nifty_signal_with_premium(generated_signal, premium) if symbol.strip().upper() == "NIFTY" else enrich_signal_with_premium(generated_signal, premium)
         if _should_skip_trade(symbol, enriched_signal, premium.last_price, candle_manager, regime_snapshot):
             return
-        _register_trade_plan(symbol, enriched_signal, premium, trade_manager, candle_manager, regime_snapshot)
+        if _mode_label() != "PAPER":
+            _register_trade_plan(symbol, enriched_signal, premium, trade_manager, candle_manager, regime_snapshot)
         _print_signal(enriched_signal)
     elif generated_signal.signal == "BUY_PE":
         premium = _safe_premium_quote(premium_service, symbol, spot_price, "PUT")
@@ -223,7 +224,8 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, mcx
         enriched_signal = enrich_nifty_signal_with_premium(generated_signal, premium) if symbol.strip().upper() == "NIFTY" else enrich_signal_with_premium(generated_signal, premium)
         if _should_skip_trade(symbol, enriched_signal, premium.last_price, candle_manager, regime_snapshot):
             return
-        _register_trade_plan(symbol, enriched_signal, premium, trade_manager, candle_manager, regime_snapshot)
+        if _mode_label() != "PAPER":
+            _register_trade_plan(symbol, enriched_signal, premium, trade_manager, candle_manager, regime_snapshot)
         _print_signal(enriched_signal)
     elif generated_signal.signal in {"BUY", "SELL"}:
         option_chain = mcx_option_chain_service.get_option_chain(symbol, spot_price)
@@ -232,7 +234,7 @@ def _handle_generated_signal(symbol: str, generated_signal, premium_service, mcx
         premium_price = option.premium_ltp if option is not None and option.premium_ltp is not None else None
         if premium_price is not None and _should_skip_trade(symbol, enriched_signal, premium_price, candle_manager, regime_snapshot):
             return
-        if option is not None:
+        if option is not None and _mode_label() != "PAPER":
             planned_trade = _register_mcx_trade_plan(symbol, enriched_signal, trade_manager, candle_manager, regime_snapshot)
             if planned_trade is None:
                 logging.info("Skipping MCX trade plan print for %s because plan registration did not succeed.", symbol)
@@ -268,7 +270,7 @@ def _register_trade_plan(
     option = generated_signal.details.option_suggestion
     if option.entry_low is None or option.entry_high is None or option.stop_loss is None:
         return None
-    if trade_manager.has_active_trade(symbol):
+    if _mode_label() != "PAPER" and trade_manager.has_active_trade(symbol):
         logging.info("Skipping signal for %s because one active trade already exists.", symbol)
         return None
     planned_stop_loss = _planned_stop_loss(
@@ -322,9 +324,6 @@ def _register_mcx_trade_plan(
         or option.target is None
         or not option.trading_symbol
     ):
-        return None
-    if trade_manager.has_active_trade(symbol):
-        logging.info("Skipping MCX signal for %s because one active trade already exists.", symbol)
         return None
 
     entry_price = generated_signal.entry_price if generated_signal.entry_price is not None else option.entry_high
@@ -842,11 +841,7 @@ def _refresh_trade_extremes(active_trade: ActiveTrade, current_price: float, tra
 
 
 def _default_sentiment() -> dict[str, object]:
-    return {
-        "sentiment": "SIDEWAYS",
-        "confidence": 0.0,
-        "reason": "sentiment_disabled",
-    }
+    return {}
 
 
 def _extract_order_price(order: dict[str, object], fallback_price: float) -> float:
@@ -1469,6 +1464,9 @@ def _env_int(name: str, default: int) -> int:
 
 if __name__ == "__main__":
     main()
+
+
+
 
 
 
